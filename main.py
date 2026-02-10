@@ -135,53 +135,62 @@ def predict_next_minute(df):
 
 def create_plot(df, predicted_price, next_time):
     plt.style.use('dark_background')
-    fig, ax = plt.subplots(figsize=(12, 7)) # Чуть увеличил ширину для подписей
+    # Увеличиваем высоту, чтобы текст не налезал
+    fig, ax = plt.subplots(figsize=(12, 8))
     
-    # Берем последние 15-20 минут, чтобы не было слишком тесно
-    plot_df = df.tail(20).copy()
+    # Берем последние 15 точек, чтобы разместить текст без нагромождения
+    plot_df = df.tail(15).copy()
     
     plot_df['close_time_plot'] = plot_df['close_time'].dt.tz_localize(None)
     next_time_plot = next_time.replace(tzinfo=None) if next_time.tzinfo else next_time
     
     # Линия истории
     ax.plot(plot_df['close_time_plot'], plot_df['close'], 
-            label='История', color='cyan', marker='o', linestyle='-', markersize=6)
+            color='cyan', marker='o', linestyle='-', markersize=8, zorder=2)
     
     # Линия прогноза
     ax.plot([plot_df['close_time_plot'].iloc[-1], next_time_plot],
             [plot_df['close'].iloc[-1], predicted_price],
-            label='Прогноз AI', color='lime', linestyle='--', marker='x', markersize=8)
+            color='lime', linestyle='--', marker='x', markersize=10, zorder=2)
     
     # Точка прогноза
-    ax.scatter(next_time_plot, predicted_price, color='lime', s=150, zorder=5, edgecolors='white')
+    ax.scatter(next_time_plot, predicted_price, color='lime', s=200, zorder=3, edgecolors='white')
 
-    # ПОДПИСИ ЦЕНЫ РЯДОМ С ТОЧКАМИ
-    # Для исторических точек
-    for x, y in zip(plot_df['close_time_plot'], plot_df['close']):
-        label = f"{y:.0f}"
-        # Сдвигаем текст чуть выше точки
-        ax.annotate(label, (x, y), textcoords="offset points", xytext=(0,8), 
-                    ha='center', fontsize=8, color='white', fontweight='bold')
-
-    # Для точки прогноза
-    ax.annotate(f"{predicted_price:.0f}", 
-                (next_time_plot, predicted_price), textcoords="offset points", 
-                xytext=(0,8), ha='center', fontsize=9, color='lime', fontweight='bold')
-
-    ax.set_title(f"BTC/USDT AI Prediction ({TIMEZONE_STR})", color='white', fontsize=14)
-    ax.set_xlabel("Время", color='gray')
-    ax.set_ylabel("Цена ($)", color='gray')
-    ax.grid(True, color='gray', linestyle=':', alpha=0.5)
-    ax.legend()
-
-    # --- НАСТРОЙКА ОСИ X (МИНУТНЫЙ ИНТЕРВАЛ) ---
-    # Устанавливаем локатор на минуты
-    ax.xaxis.set_major_locator(mdates.MinuteLocator(interval=1))
-    # Форматируем как ЧЧ:ММ
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+    # --- ОТРИСОВКА ТЕКСТА НА ТОЧКАХ ---
     
-    # Поворачиваем подписи, чтобы не наезжали
-    fig.autofmt_xdate(rotation=45)
+    # 1. Для исторических точек
+    for x, y, time_obj in zip(plot_df['close_time_plot'], plot_df['close'], plot_df['close_time']):
+        time_str = time_obj.strftime('%H:%M')
+        price_str = f"{y:.0f}"
+        
+        # Время (ЧЧ:ММ) СВЕРХУ точки
+        ax.annotate(time_str, (x, y), textcoords="offset points", xytext=(0,12), 
+                    ha='center', fontsize=9, color='yellow', fontweight='bold')
+        
+        # Цена (снизу) точки
+        ax.annotate(price_str, (x, y), textcoords="offset points", xytext=(0,-12), 
+                    ha='center', fontsize=8, color='white')
+
+    # 2. Для точки прогноза
+    pred_time_str = next_time.strftime('%H:%M')
+    pred_price_str = f"{predicted_price:.0f}"
+    
+    # Время прогноза
+    ax.annotate(pred_time_str, (next_time_plot, predicted_price), textcoords="offset points", xytext=(0,15), 
+                ha='center', fontsize=10, color='lime', fontweight='bold')
+    # Цена прогноза
+    ax.annotate(pred_price_str, (next_time_plot, predicted_price), textcoords="offset points", xytext=(0,-15), 
+                ha='center', fontsize=9, color='lime', fontweight='bold')
+
+    # УБИРАЕМ ОСЬ X (шкалу времени внизу), так как она не нужна
+    ax.get_xaxis().set_visible(False)
+    
+    ax.set_title(f"BTC/USDT AI Prediction ({TIMEZONE_STR})", color='white', fontsize=16)
+    ax.set_ylabel("Цена ($)", color='gray')
+    ax.grid(True, color='gray', linestyle=':', alpha=0.3)
+    
+    # Убираем легенду, чтобы не мешала
+    ax.legend(['История', 'Прогноз AI'], loc='upper left')
 
     buf = BytesIO()
     plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
@@ -303,4 +312,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
-
