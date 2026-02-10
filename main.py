@@ -31,38 +31,46 @@ is_predicting = False
 # --- ФУНКЦИИ ДАННЫХ И ИНДИКАТОРОВ ---
 
 async def get_binance_klines(interval='1m', limit=20):
-    """Получает данные свечей. Используем публичный прокси Binance, чтобы избежать ошибки 451."""
-    # Пробуем основной адрес, а если не выйдет - публичное зеркало
-    urls = [
-        "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval={}&limit={}",
-        "https://api1.binance.com/api/v3/klines?symbol=BTCUSDT&interval={}&limit={}",
-        # Можно добавить зеркало через corsproxy если нужно, но обычно api1 работает
-    ]
+    """
+    Получает данные свечей с Bybit (вместо Binance), чтобы избежать гео-блокировок.
+    Bybit возвращает данные в таком же формате, который нам нужен.
+    """
+    # Bybit API endpoint
+    url = f"https://api.bybit.com/v5/market/kline?category=spot&symbol=BTCUSDT&interval={interval}&limit={limit}"
     
-    for url_template in urls:
-        url = url_template.format(interval, limit)
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        df = pd.DataFrame(data, columns=[
-                            'open_time', 'open', 'high', 'low', 'close', 'volume',
-                            'close_time', 'quote_volume', 'trades', 'taker_buy_base',
-                            'taker_buy_quote', 'ignore'
-                        ])
-                        df['close_time'] = pd.to_datetime(df['close_time'], unit='ms')
-                        df['close'] = pd.to_numeric(df['close'])
-                        return df[['close_time', 'close']]
-                    elif response.status == 451:
-                        logging.warning(f"Binance вернул ошибку 451 на {url}. Пробуем следующий источник...")
-                        continue
-        except Exception as e:
-            logging.warning(f"Ошибка подключения к {url}: {e}")
-            continue
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    
+                    # Проверяем, что данные пришли
+                    if data.get('retCode') != 0 or not data.get('result', {}).get('list'):
+                        logging.error(f"Ошибка Bybit API: {data.get('retMsg')}")
+                        return None
 
-    logging.error("Не удалось получить данные ни с одного зеркала Binance.")
-    return None
+                    # Парсим данные Bybit
+                    # Формат Bybit v5: [[startTime, open, high, low, close, volume, ...], ...]
+                    raw_list = data['result']['list']
+                    # Разворачиваем список, так как Bybit присылает от нового к старому
+                    raw_list.reverse()
+                    
+                    df = pd.DataFrame(raw_list, columns=[
+                        'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                        'turnover', 'ignore1', 'ignore2', 'ignore3'
+                    ])
+                    
+                    # Преобразуем в формат, понятный нашему боту
+                    df['close_time'] = pd.to_datetime(df['timestamp'].astype(int), unit='ms')
+                    df['close'] = pd.to_numeric(df['close'])
+                    
+                    return df[['close_time', 'close']]
+                else:
+                    logging.error(f"Ошибка Bybit HTTP: {response.status}")
+                    return None
+    except Exception as e:
+        logging.error(f"Ошибка подключения к Bybit: {e}")
+        return None
 
 def calculate_rsi(series, period=14):
     """Расчет RSI."""
@@ -318,4 +326,5 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
+
 
