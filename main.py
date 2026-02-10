@@ -16,12 +16,15 @@ from aiogram.types import BufferedInputFile, ReplyKeyboardMarkup, KeyboardButton
 from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import MinMaxScaler
 from collections import defaultdict
-from zoneinfo import ZoneInfo  # Для Python 3.9+, если старее - сообщите
+from zoneinfo import ZoneInfo
 
 # --- КОНФИГУРАЦИЯ ---
 TELEGRAM_TOKEN = "2122435147:AAG_52ELCHjFnXNxcAP4i5xNAal9I91xNTM"
 
-# Укажите вашу зону. Москва = Europe/Moscow. Если время все равно не то, поменяйте на 'UTC' или свой город.
+# ВРЕМЕННАЯ ЗОНА
+# Telegram не дает нам timezone пользователя. Мы ставим его здесь.
+# Если бот на сервере в UTC, а вы хотите МСК - ставьте 'Europe/Moscow'.
+# Если хотите "нейтральное" время сервера - поставьте 'UTC'.
 TIMEZONE_STR = "Europe/Moscow"
 LOCAL_TIMEZONE = ZoneInfo(TIMEZONE_STR)
 
@@ -54,11 +57,12 @@ async def get_market_data():
                         return None
 
                     df = pd.DataFrame(prices, columns=['timestamp', 'close'])
-                    # Конвертируем из UTC в ЛОКАЛЬНУЮ ЗОНУ
+                    # Конвертируем timestamp из API (UTC) в наш Local Timezone
                     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
                     df['timestamp'] = df['timestamp'].dt.tz_localize('UTC').dt.tz_convert(LOCAL_TIMEZONE)
                     
                     df = df.rename(columns={'timestamp': 'close_time'})
+                    # Берем последние 30 точек
                     df = df.tail(30).reset_index(drop=True)
                     return df
                 else:
@@ -131,7 +135,13 @@ def predict_next_minute(df):
     else:
         avg_step = timedelta(minutes=1)
 
-    next_time = last_data_time + avg_step
+    # ВАЖНОЕ ИСПРАВЛЕНИЕ:
+    # Вместо того чтобы прибавлять шаг к последнему времени из данных (которое может быть старым),
+    # мы используем ТЕКУЩЕЕ время системы, скорректированное на Local Timezone.
+    # +1 минута для прогноза "на следующую минуту".
+    now_time = datetime.now(LOCAL_TIMEZONE)
+    # Округляем до ближайшей минуты для красоты, или просто берем текущую + 1 мин
+    next_time = (now_time.replace(second=0, microsecond=0) + timedelta(minutes=1))
 
     return df, predicted_price, next_time
 
@@ -141,11 +151,7 @@ def create_plot(df, predicted_price, next_time):
 
     plot_df = df.tail(10).copy()
     
-    # --- ИСПРАВЛЕНИЕ ВРЕМЕНИ ---
-    # Удаляем информацию о часовом поясе для отрисовки (matplotlib с этим лучше справляется, если ему просто сказать, что это "числа"),
-    # НО мы удаляем её ПОСЛЕ того, как сконвертировали время в df.
-    # Поскольку в df время уже LOCAL_TIMEZONE (например, 13:27 МСК), 
-    # при обрезке tz_localize(None) оно останется 13:27.
+    # Подготовка времени для графика
     plot_df['close_time_plot'] = plot_df['close_time'].dt.tz_localize(None)
     next_time_plot = next_time.tz_localize(None)
     
@@ -208,7 +214,7 @@ async def cmd_start(message: types.Message):
     await message.answer(
         "👋 Добро пожаловать в AI BTC Predictor!\n\n"
         "Я анализирую рынок с помощью нейросети и выдаю краткосрочный прогноз.\n"
-        f"Часовой пояс бота: {TIMEZONE_STR}.",
+        f"Часовой пояс: {TIMEZONE_STR}.",
         reply_markup=main_keyboard
     )
 
@@ -216,10 +222,10 @@ async def cmd_start(message: types.Message):
 async def cmd_info(message: types.Message):
     await message.answer(
         f"📊 **Как это работает:**\n"
-        f"1. Данные CoinGecko (BTC/USD).\n"
-        f"2. Время конвертируется в вашу локальную зону ({TIMEZONE_STR}).\n"
-        f"3. Нейросеть MLP делает прогноз.\n\n"
-        "⚠️ *Важно:* Это не финансовый совет.",
+        f"1. Источник данных: CoinGecko (BTC/USD).\n"
+        f"2. Данные обновляются каждые несколько минут (не секунда в секунду).\n"
+        f"3. Время прогноза синхронизировано с текущим временем ({TIMEZONE_STR}).\n\n"
+        "⚠️ *Не является финансовым советом.*",
         parse_mode="Markdown"
     )
 
