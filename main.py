@@ -1,7 +1,9 @@
+import sys
+import os
 import telebot
 import numpy as np
 import matplotlib
-# Указываем бэкенд Agg, чтобы на сервере не было ошибок с графикой
+# Важно для сервера: использовать Agg backend
 matplotlib.use('Agg') 
 import matplotlib.pyplot as plt
 import io
@@ -18,10 +20,10 @@ from datetime import datetime, timedelta, timezone
 from flask import Flask
 
 # --- КОНФИГУРАЦИЯ ---
-# Ваш токен внутри кода
+# Ваш токен
 TELEGRAM_TOKEN = "2122435147:AAG_52ELCHjFnXNxcAP4i5xNAal9I91xNTM"
 
-# Настройка порта для Railway (если переменная есть, берем её, иначе 8080 по умолчанию)
+# Настройка порта для Railway
 PORT = int(os.environ.get('PORT', 8080))
 
 # Инициализация бота
@@ -31,7 +33,7 @@ bot = telebot.TeleBot(TELEGRAM_TOKEN)
 logging.basicConfig(
     level=logging.INFO, 
     format='%(asctime)s - %(levelname)s - %(message)s',
-    stream=sys.stdout # Вывод логов в консоль (видно в Railway Logs)
+    stream=sys.stdout
 )
 logger = logging.getLogger(__name__)
 
@@ -43,7 +45,7 @@ def index():
     return "Bot is alive"
 
 def run_flask():
-    # Запускаем веб-сервер в отдельном потоке, чтобы не мешать боту
+    # Запускаем веб-сервер в отдельном потоке
     app.run(host='0.0.0.0', port=PORT, use_reloader=False)
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
@@ -54,17 +56,15 @@ def get_moscow_time():
     return datetime.now(moscow_tz)
 
 def round_to_minute(dt):
-    """Округляет время до ровной минуты (сбрасывает секунды и микросекунды)"""
+    """Округляет время до ровной минуты"""
     return dt.replace(second=0, microsecond=0)
 
 # --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
-# Храним данные в формате: {'price': float, 'time': datetime(секунды=0)}
 chart_data_buffer = deque(maxlen=20) 
 current_symbol = None
 stop_websocket_flag = False
 current_chat_id = None
 is_busy = False
-# Переменная, чтобы помнить, какую минуту мы уже обработали
 last_processed_minute = None 
 
 # --- КЛАВИАТУРЫ ---
@@ -82,15 +82,12 @@ asset_keyboard.row(telebot.types.KeyboardButton("Назад"))
 # --- ЛОГИКА WEBSOCKET ---
 
 async def binance_websocket_logic(symbol, chat_id):
-    """Основная логика подключения к WS с фильтрацией по минутам"""
     global chart_data_buffer, current_symbol, stop_websocket_flag, is_busy, last_processed_minute
     
     current_symbol = symbol.lower()
-    # Используем стрим всех сделок или тикер. Для точности минут лучше ticker, но он часто шлет.
-    # Мы будем фильтровать сами.
     uri = f"wss://stream.binance.com:9443/ws/{current_symbol}@ticker"
     chart_data_buffer.clear()
-    last_processed_minute = None # Сброс фильтра при новой паре
+    last_processed_minute = None
     
     try:
         async with websockets.connect(uri) as ws:
@@ -100,50 +97,44 @@ async def binance_websocket_logic(symbol, chat_id):
             
             while not stop_websocket_flag:
                 try:
-                    # Получаем данные
                     message = await asyncio.wait_for(ws.recv(), timeout=1.0)
                     data = json.loads(message)
                     close_price = float(data['c'])
                     
-                    # Получаем время и округляем до ровной минуты
+                    # Логика времени: округляем до минут
                     now_utc = datetime.now(timezone.utc)
                     now_moscow = now_utc.astimezone(timezone(timedelta(hours=3)))
                     current_minute_rounded = round_to_minute(now_moscow)
                     
-                    # ФИЛЬТР: Если эта минута уже была обработана, пропускаем
+                    # Пропускаем, если эта минута уже записана
                     if current_minute_rounded == last_processed_minute:
                         continue
                     
-                    # Если минута новая - обновляем данные
                     last_processed_minute = current_minute_rounded
                     
-                    # Добавляем в буфер (цена и уже округленное время)
                     chart_data_buffer.append({'price': close_price, 'time': current_minute_rounded})
-                    logger.info(f"Новая свеча: {current_minute_rounded.strftime('%H:%M')} | Цена: {close_price}")
+                    logger.info(f"Свеча: {current_minute_rounded.strftime('%H:%M')} | Цена: {close_price}")
                     
-                    # АВТОМАТИЧЕСКАЯ ОТПРАВКА
                     if not prediction_sent and len(chart_data_buffer) >= 12:
-                        logger.info("Данных достаточно (12 минут), отправляем прогноз...")
+                        logger.info("Данных достаточно, отправляем прогноз...")
                         threading.Thread(target=send_prediction, args=(chat_id,)).start()
                         prediction_sent = True
                         
                 except asyncio.TimeoutError:
                     continue
                 except websockets.exceptions.ConnectionClosed:
-                    logger.warning("Соединение WebSocket закрыто. Переподключение...")
+                    logger.warning("Соединение WebSocket закрыто.")
                     break 
                 except Exception as e:
-                    logger.error(f"Ошибка внутри цикла WS: {e}")
-                    # Если ошибка критическая, выходим из цикла, чтобы поток завершился корректно
+                    logger.error(f"Ошибка WS: {e}")
                     break
     except Exception as e:
-        logger.error(f"Критическая ошибка подключения WS: {e}")
+        logger.error(f"Критическая ошибка подключения: {e}")
     finally:
-        logger.info("WebSocket поток завершил работу. Снятие блокировки.")
+        logger.info("WebSocket поток завершен.")
         is_busy = False
 
 def run_websocket_thread(symbol, chat_id):
-    """Функция для запуска в отдельном потоке."""
     global stop_websocket_flag
     stop_websocket_flag = False
     
@@ -153,7 +144,7 @@ def run_websocket_thread(symbol, chat_id):
     try:
         loop.run_until_complete(binance_websocket_logic(symbol, chat_id))
     except Exception as e:
-        logger.error(f"Ошибка в потоке WebSocket: {e}")
+        logger.error(f"Ошибка в потоке: {e}")
         is_busy = False
     finally:
         loop.close()
@@ -170,13 +161,11 @@ def predict_price(data_buffer):
     X = np.arange(len(prices)).reshape(-1, 1)
     y = prices
     
-    # Полиномиальная регрессия (степень 2)
     poly = PolynomialFeatures(degree=2)
     X_poly = poly.fit_transform(X)
     model = LinearRegression()
     model.fit(X_poly, y)
     
-    # Предсказываем следующий шаг
     next_point = np.array([[len(prices)]])
     next_point_poly = poly.transform(next_point)
     predicted_close = model.predict(next_point_poly)[0]
@@ -187,38 +176,27 @@ def predict_price(data_buffer):
 def create_price_chart(data_buffer, predicted_close=None):
     plt.figure(figsize=(10, 5))
     
-    # Подготовка данных
     last_points = list(data_buffer)[-20:] 
     prices = [d['price'] for d in last_points]
     timestamps = [d['time'] for d in last_points]
     
-    # Формирование меток времени (только Часы:Минуты)
     time_labels = [t.strftime('%H:%M') for t in timestamps]
     x_values = range(len(last_points))
     
-    # График
     plt.plot(x_values, prices, 'bo-', linewidth=1.5, markersize=5, label='Цены закрытия')
-    
-    # Настройка осей
     plt.xticks(x_values, time_labels, rotation=45, ha='right', fontsize=8)
     
     if predicted_close is not None:
         next_x = len(last_points)
         plt.plot(next_x, predicted_close, 'ro', markersize=8, label='Прогноз')
-        
-        # Подпись цены прогноза
         plt.text(next_x, predicted_close, f'{predicted_close:.2f}', ha='center', va='bottom', fontsize=10, color='red', fontweight='bold')
-        
-        # Линия тренда
         plt.plot([x_values[-1], next_x], [prices[-1], predicted_close], 'r--', alpha=0.5)
         
-        # Время прогноза (+1 минута от последней свечи)
         last_time = timestamps[-1]
         pred_time = last_time + timedelta(minutes=1)
         pred_time_label = pred_time.strftime('%H:%M')
         plt.xticks(list(x_values) + [next_x], time_labels + [pred_time_label], rotation=45, ha='right', fontsize=8)
 
-    # Название пары (BTC/USDT)
     display_symbol = f"{current_symbol.upper()[:3]}/{current_symbol.upper()[3:]}" if current_symbol else "АКТИВ"
     plt.title(f'Прогноз цены {display_symbol}')
     plt.xlabel('Время (Москва)')
@@ -274,7 +252,7 @@ def process_symbol_selection(message):
     global stop_websocket_flag, current_chat_id, is_busy
     
     if is_busy:
-        bot.send_message(message.chat.id, "⏳ Подождите, я обрабатываю предыдущий запрос...", reply_markup=asset_keyboard)
+        bot.send_message(message.chat_id, "⏳ Подождите, я обрабатываю предыдущий запрос...", reply_markup=asset_keyboard)
         return
 
     symbol = message.text
@@ -282,13 +260,11 @@ def process_symbol_selection(message):
     
     is_busy = True
     
-    # Остановка старого потока
     stop_websocket_flag = True
     time.sleep(0.2) 
     
     stop_websocket_flag = False
     
-    # Запуск нового потока
     ws_thread = threading.Thread(target=run_websocket_thread, args=(symbol, current_chat_id))
     ws_thread.daemon = True
     ws_thread.start()
@@ -320,11 +296,8 @@ def handle_text(message):
         bot.send_message(message.chat.id, "Собираю данные...", reply_markup=main_keyboard)
 
 if __name__ == '__main__':
-    import sys
-    
-    # Запускаем Flask в отдельном потоке для работы с Railway
+    # Запускаем Flask в отдельном потоке
     flask_thread = threading.Thread(target=run_flask)
-    # daemon=True позволяет потоку завершиться, когда завершится основной скрипт
     flask_thread.daemon = True 
     flask_thread.start()
     
@@ -332,7 +305,6 @@ if __name__ == '__main__':
     logger.info(f"Flask сервер запущен на порту {PORT}")
     
     try:
-        # Запускаем бота
         bot.infinity_polling(timeout=10, long_polling_timeout=5)
     except Exception as e:
         logger.error(f"Критический сбой: {e}")
