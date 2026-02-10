@@ -38,8 +38,12 @@ user_limits = defaultdict(lambda: {'balance': STARTING_BALANCE, 'last_prediction
 # --- ФУНКЦИИ ---
 
 async def get_market_data():
-    """Получает данные с CoinGecko (1 минута)."""
-    url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=0.1"
+    """
+    Получает данные с CoinGecko API.
+    ИСПРАВЛЕНИЕ: days=0.05 (около 1.2 часа) дает минутные свечи.
+    Если days=1, CoinGecko дает 5-минутные свечи.
+    """
+    url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=0.05"
     
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
@@ -59,7 +63,8 @@ async def get_market_data():
                     df['timestamp'] = df['timestamp'].dt.tz_localize('UTC').dt.tz_convert(LOCAL_TIMEZONE)
                     
                     df = df.rename(columns={'timestamp': 'close_time'})
-                    df = df.tail(50).reset_index(drop=True)
+                    # Берем последние 60 точек (теперь это 60 минут)
+                    df = df.tail(60).reset_index(drop=True)
                     return df
                 else:
                     logging.error(f"Ошибка CoinGecko HTTP: {response.status}")
@@ -135,11 +140,10 @@ def predict_next_minute(df):
 
 def create_plot(df, predicted_price, next_time):
     plt.style.use('dark_background')
-    # Увеличиваем высоту, чтобы текст не налезал
     fig, ax = plt.subplots(figsize=(12, 8))
     
-    # Берем последние 15 точек, чтобы разместить текст без нагромождения
-    plot_df = df.tail(15).copy()
+    # Берем последние 20 минут для отображения
+    plot_df = df.tail(20).copy()
     
     plot_df['close_time_plot'] = plot_df['close_time'].dt.tz_localize(None)
     next_time_plot = next_time.replace(tzinfo=None) if next_time.tzinfo else next_time
