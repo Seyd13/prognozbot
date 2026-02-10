@@ -21,10 +21,7 @@ from zoneinfo import ZoneInfo
 # --- КОНФИГУРАЦИЯ ---
 TELEGRAM_TOKEN = "2122435147:AAG_52ELCHjFnXNxcAP4i5xNAal9I91xNTM"
 
-# ВРЕМЕННАЯ ЗОНА
-# Telegram не дает нам timezone пользователя. Мы ставим его здесь.
-# Если бот на сервере в UTC, а вы хотите МСК - ставьте 'Europe/Moscow'.
-# Если хотите "нейтральное" время сервера - поставьте 'UTC'.
+# Настройка временной зоны
 TIMEZONE_STR = "Europe/Moscow"
 LOCAL_TIMEZONE = ZoneInfo(TIMEZONE_STR)
 
@@ -57,12 +54,11 @@ async def get_market_data():
                         return None
 
                     df = pd.DataFrame(prices, columns=['timestamp', 'close'])
-                    # Конвертируем timestamp из API (UTC) в наш Local Timezone
+                    # Конвертация времени: ms -> UTC -> Local
                     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
                     df['timestamp'] = df['timestamp'].dt.tz_localize('UTC').dt.tz_convert(LOCAL_TIMEZONE)
                     
                     df = df.rename(columns={'timestamp': 'close_time'})
-                    # Берем последние 30 точек
                     df = df.tail(30).reset_index(drop=True)
                     return df
                 else:
@@ -127,21 +123,14 @@ def predict_next_minute(df):
     predicted_price_full = scaler.inverse_transform(dummy_array)
     predicted_price = predicted_price_full[0, 0]
 
-    last_data_time = df['close_time'].iloc[-1]
+    # --- ИСПРАВЛЕНИЕ ВРЕМЕНИ (Real Time) ---
+    # Мы не используем время из API для прогноза, так как оно может запаздывать.
+    # Мы берем текущее время системы и приводим его к нужной зоне.
+    now_utc = datetime.now(timezone.utc)
+    now_local = now_utc.astimezone(LOCAL_TIMEZONE)
     
-    if len(df) > 1:
-        time_diffs = df['close_time'].diff().dropna()
-        avg_step = time_diffs.median()
-    else:
-        avg_step = timedelta(minutes=1)
-
-    # ВАЖНОЕ ИСПРАВЛЕНИЕ:
-    # Вместо того чтобы прибавлять шаг к последнему времени из данных (которое может быть старым),
-    # мы используем ТЕКУЩЕЕ время системы, скорректированное на Local Timezone.
-    # +1 минута для прогноза "на следующую минуту".
-    now_time = datetime.now(LOCAL_TIMEZONE)
-    # Округляем до ближайшей минуты для красоты, или просто берем текущую + 1 мин
-    next_time = (now_time.replace(second=0, microsecond=0) + timedelta(minutes=1))
+    # Прогноз на следующую минуту (округляем текущую + 1 мин)
+    next_time = now_local.replace(second=0, microsecond=0) + timedelta(minutes=1)
 
     return df, predicted_price, next_time
 
@@ -151,10 +140,16 @@ def create_plot(df, predicted_price, next_time):
 
     plot_df = df.tail(10).copy()
     
-    # Подготовка времени для графика
+    # Убираем timezone для отрисовки в matplotlib, но само значение времени уже локальное (МСК)
     plot_df['close_time_plot'] = plot_df['close_time'].dt.tz_localize(None)
-    next_time_plot = next_time.tz_localize(None)
     
+    # Обработка next_time (это стандартный datetime, а не Pandas Series)
+    # Нам нужно заменить timezone_info на None для отрисовки
+    if next_time.tzinfo is not None:
+        next_time_plot = next_time.replace(tzinfo=None)
+    else:
+        next_time_plot = next_time
+
     ax.plot(plot_df['close_time_plot'], plot_df['close'], 
             label='История', color='cyan', marker='o', linestyle='-')
 
@@ -222,10 +217,9 @@ async def cmd_start(message: types.Message):
 async def cmd_info(message: types.Message):
     await message.answer(
         f"📊 **Как это работает:**\n"
-        f"1. Источник данных: CoinGecko (BTC/USD).\n"
-        f"2. Данные обновляются каждые несколько минут (не секунда в секунду).\n"
-        f"3. Время прогноза синхронизировано с текущим временем ({TIMEZONE_STR}).\n\n"
-        "⚠️ *Не является финансовым советом.*",
+        f"1. Источник: CoinGecko.\n"
+        f"2. Время прогноза: Текущее локальное ({TIMEZONE_STR}).\n\n"
+        "⚠️ *Не финансовый совет.*",
         parse_mode="Markdown"
     )
 
