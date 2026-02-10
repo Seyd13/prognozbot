@@ -31,25 +31,38 @@ is_predicting = False
 # --- ФУНКЦИИ ДАННЫХ И ИНДИКАТОРОВ ---
 
 async def get_binance_klines(interval='1m', limit=20):
-    """Получает данные свечей с Binance."""
-    url = f"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval={interval}&limit={limit}"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as response:
-            if response.status == 200:
-                data = await response.json()
-                # Преобразуем в DataFrame: [Time, Open, High, Low, Close, Volume, ...]
-                df = pd.DataFrame(data, columns=[
-                    'open_time', 'open', 'high', 'low', 'close', 'volume',
-                    'close_time', 'quote_volume', 'trades', 'taker_buy_base',
-                    'taker_buy_quote', 'ignore'
-                ])
-                # Конвертируем типы
-                df['close_time'] = pd.to_datetime(df['close_time'], unit='ms')
-                df['close'] = pd.to_numeric(df['close'])
-                return df[['close_time', 'close']]
-            else:
-                logging.error(f"Ошибка Binance API: {response.status}")
-                return None
+    """Получает данные свечей. Используем публичный прокси Binance, чтобы избежать ошибки 451."""
+    # Пробуем основной адрес, а если не выйдет - публичное зеркало
+    urls = [
+        "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval={}&limit={}",
+        "https://api1.binance.com/api/v3/klines?symbol=BTCUSDT&interval={}&limit={}",
+        # Можно добавить зеркало через corsproxy если нужно, но обычно api1 работает
+    ]
+    
+    for url_template in urls:
+        url = url_template.format(interval, limit)
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        df = pd.DataFrame(data, columns=[
+                            'open_time', 'open', 'high', 'low', 'close', 'volume',
+                            'close_time', 'quote_volume', 'trades', 'taker_buy_base',
+                            'taker_buy_quote', 'ignore'
+                        ])
+                        df['close_time'] = pd.to_datetime(df['close_time'], unit='ms')
+                        df['close'] = pd.to_numeric(df['close'])
+                        return df[['close_time', 'close']]
+                    elif response.status == 451:
+                        logging.warning(f"Binance вернул ошибку 451 на {url}. Пробуем следующий источник...")
+                        continue
+        except Exception as e:
+            logging.warning(f"Ошибка подключения к {url}: {e}")
+            continue
+
+    logging.error("Не удалось получить данные ни с одного зеркала Binance.")
+    return None
 
 def calculate_rsi(series, period=14):
     """Расчет RSI."""
@@ -305,3 +318,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
+
