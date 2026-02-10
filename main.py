@@ -38,15 +38,13 @@ user_limits = defaultdict(lambda: {'balance': STARTING_BALANCE, 'last_prediction
 # --- ФУНКЦИИ ---
 
 async def get_market_data():
-    """Получает данные с защитой от обрыва соединения."""
-    # days=0.1 дает минутные данные
+    """Получает данные с CoinGecko (1 минута)."""
     url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=0.1"
     
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
     }
 
-    # Увеличиваем таймаут до 20 секунд, так как Railway на бесплатном тарифе может долго "просыпаться"
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as response:
@@ -57,7 +55,6 @@ async def get_market_data():
                         return None
 
                     df = pd.DataFrame(prices, columns=['timestamp', 'close'])
-                    # Конвертация времени
                     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
                     df['timestamp'] = df['timestamp'].dt.tz_localize('UTC').dt.tz_convert(LOCAL_TIMEZONE)
                     
@@ -68,7 +65,7 @@ async def get_market_data():
                     logging.error(f"Ошибка CoinGecko HTTP: {response.status}")
                     return None
     except asyncio.TimeoutError:
-        logging.error("Таймаут соединения (контейнер просыпается)")
+        logging.error("Таймаут соединения")
         return None
     except Exception as e:
         logging.error(f"Ошибка подключения: {e}")
@@ -138,34 +135,53 @@ def predict_next_minute(df):
 
 def create_plot(df, predicted_price, next_time):
     plt.style.use('dark_background')
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, ax = plt.subplots(figsize=(12, 7)) # Чуть увеличил ширину для подписей
+    
+    # Берем последние 15-20 минут, чтобы не было слишком тесно
     plot_df = df.tail(20).copy()
     
     plot_df['close_time_plot'] = plot_df['close_time'].dt.tz_localize(None)
     next_time_plot = next_time.replace(tzinfo=None) if next_time.tzinfo else next_time
     
+    # Линия истории
     ax.plot(plot_df['close_time_plot'], plot_df['close'], 
-            label='История', color='cyan', marker='o', linestyle='-')
+            label='История', color='cyan', marker='o', linestyle='-', markersize=6)
+    
+    # Линия прогноза
     ax.plot([plot_df['close_time_plot'].iloc[-1], next_time_plot],
             [plot_df['close'].iloc[-1], predicted_price],
-            label='Прогноз AI', color='lime', linestyle='--', marker='x')
-    ax.scatter(next_time_plot, predicted_price, color='lime', s=100, zorder=5)
+            label='Прогноз AI', color='lime', linestyle='--', marker='x', markersize=8)
+    
+    # Точка прогноза
+    ax.scatter(next_time_plot, predicted_price, color='lime', s=150, zorder=5, edgecolors='white')
 
+    # ПОДПИСИ ЦЕНЫ РЯДОМ С ТОЧКАМИ
+    # Для исторических точек
     for x, y in zip(plot_df['close_time_plot'], plot_df['close']):
         label = f"{y:.0f}"
-        ax.annotate(label, (x, y), textcoords="offset points", xytext=(0,10), ha='center', fontsize=8, color='white')
+        # Сдвигаем текст чуть выше точки
+        ax.annotate(label, (x, y), textcoords="offset points", xytext=(0,8), 
+                    ha='center', fontsize=8, color='white', fontweight='bold')
 
-    ax.annotate(f"AI: {predicted_price:.0f}", 
+    # Для точки прогноза
+    ax.annotate(f"{predicted_price:.0f}", 
                 (next_time_plot, predicted_price), textcoords="offset points", 
-                xytext=(0,10), ha='center', fontsize=9, color='lime', fontweight='bold')
+                xytext=(0,8), ha='center', fontsize=9, color='lime', fontweight='bold')
 
     ax.set_title(f"BTC/USDT AI Prediction ({TIMEZONE_STR})", color='white', fontsize=14)
     ax.set_xlabel("Время", color='gray')
     ax.set_ylabel("Цена ($)", color='gray')
     ax.grid(True, color='gray', linestyle=':', alpha=0.5)
     ax.legend()
+
+    # --- НАСТРОЙКА ОСИ X (МИНУТНЫЙ ИНТЕРВАЛ) ---
+    # Устанавливаем локатор на минуты
+    ax.xaxis.set_major_locator(mdates.MinuteLocator(interval=1))
+    # Форматируем как ЧЧ:ММ
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-    fig.autofmt_xdate()
+    
+    # Поворачиваем подписи, чтобы не наезжали
+    fig.autofmt_xdate(rotation=45)
 
     buf = BytesIO()
     plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
@@ -194,48 +210,75 @@ async def cmd_start(message: types.Message):
     user_id = message.from_user.id
     if user_id not in user_limits:
         user_limits[user_id] = {'balance': STARTING_BALANCE, 'last_prediction_time': None}
-    await message.answer("Привет! Я AI BTC Predictor.", reply_markup=main_keyboard)
+    await message.answer(
+        "👋 Добро пожаловать в AI BTC Predictor!\n\n"
+        "Я анализирую рынок с помощью нейросети и выдаю краткосрочный прогноз.\n"
+        f"Часовой пояс: {TIMEZONE_STR}.\n"
+        "Таймфрейм: 1 минута.",
+        reply_markup=main_keyboard
+    )
 
 @dp.message(F.text == "ℹ️ Информация")
 async def cmd_info(message: types.Message):
-    await message.answer(f"Часовой пояс: {TIMEZONE_STR}\nТаймфрейм: 1 минута")
+    await message.answer(
+        f"📊 **Как это работает:**\n"
+        f"1. Источник: CoinGecko (1 мин таймфрейм).\n"
+        f"2. Время прогноза: Текущее локальное ({TIMEZONE_STR}).\n\n"
+        "⚠️ *Не финансовый совет.*",
+        parse_mode="Markdown"
+    )
 
 @dp.message(F.text == "💳 Мой баланс")
 async def cmd_balance(message: types.Message):
     user_data = user_limits.get(message.from_user.id, {'balance': 0})
-    await message.answer(f"Баланс: {user_data['balance']}")
+    await message.answer(
+        f"💳 **Ваш баланс:** `{user_data['balance']}` прогнозов.",
+        parse_mode="Markdown"
+    )
 
 @dp.message(F.text == "📊 Анализ BTC")
 async def cmd_predict(message: types.Message):
     user_id = message.from_user.id
     
     if user_limits[user_id]['balance'] <= 0:
-        await message.answer("Баланс: 0")
+        await message.answer("❌ У вас закончились прогнозы. Баланс: 0.")
         return
 
     last_time = user_limits[user_id]['last_prediction_time']
     if last_time:
         now = datetime.now(LOCAL_TIMEZONE)
         if (now - last_time).total_seconds() < 60:
-            await message.answer("Подождите 1 минуту")
+            await message.answer("⏳ Пожалуйста, подождите 1 минуту перед новым запросом.")
             return
 
-    status_msg = await message.answer("⏳ Анализ...")
+    status_msg = await message.answer("⏳ Получаю данные и обучаю нейросеть...")
 
     try:
         df_raw = await get_market_data()
         if df_raw is None:
-            await status_msg.edit_text("❌ Ошибка CoinGecko (таймаут или нет данных). Попробуйте еще раз через 10 сек.")
+            await status_msg.edit_text("❌ Ошибка получения данных от CoinGecko. Попробуйте еще раз через 10 секунд.")
             return
 
         df_processed, pred_price, next_time = predict_next_minute(df_raw)
         if pred_price is None:
-            await status_msg.edit_text("❌ Модель не смогла построить прогноз.")
+            await status_msg.edit_text("❌ Не удалось построить модель (мало данных).")
             return
 
         plot_buf = create_plot(df_processed, pred_price, next_time)
         current_price = df_processed['close'].iloc[-1]
+        diff = pred_price - current_price
+        emoji = "Ⓜ️" if abs(diff) < 1 else ("📈" if diff > 0 else "📉")
         
+        time_str = next_time.strftime('%H:%M')
+        
+        caption = (
+            f"{emoji} **Прогноз BTC/USDT**\n\n"
+            f"Текущая: `{current_price:.2f}` $\n"
+            f"Прогноз на {time_str}: `{pred_price:.2f}` $\n\n"
+            f"Изменение: `{diff:+.2f}` $\n"
+            f"Осталось прогнозов: `{user_limits[user_id]['balance'] - 1}`"
+        )
+
         user_limits[user_id]['balance'] -= 1
         user_limits[user_id]['last_prediction_time'] = datetime.now(LOCAL_TIMEZONE)
 
@@ -243,12 +286,13 @@ async def cmd_predict(message: types.Message):
         await bot.send_photo(
             chat_id=message.chat.id,
             photo=plot_buf,
-            caption=f"Текущая: {current_price:.2f}\nПрогноз на {next_time.strftime('%H:%M')}: {pred_price:.2f}"
+            caption=caption,
+            parse_mode="Markdown"
         )
 
     except Exception as e:
-        logging.error(f"Critical error: {e}")
-        await status_msg.edit_text("❌ Ошибка бота.")
+        logging.error(f"Критическая ошибка: {e}")
+        await status_msg.edit_text("❌ Произошла ошибка бота.")
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
@@ -259,3 +303,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
+
