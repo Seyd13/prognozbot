@@ -38,8 +38,12 @@ user_limits = defaultdict(lambda: {'balance': STARTING_BALANCE, 'last_prediction
 # --- ФУНКЦИИ ДАННЫХ И ИНДИКАТОРЫ ---
 
 async def get_market_data():
-    """Получает данные с CoinGecko API."""
-    url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=1"
+    """
+    Получает данные с CoinGecko API.
+    ИСПРАВЛЕНИЕ: days=0.1 чтобы получить минутные данные (1 мин), а не 5-минутные.
+    """
+    # days=0.1 примерно 2.4 часа. API CoinGecko дает минутную детализацию для коротких интервалов.
+    url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=0.1"
     
     try:
         headers = {
@@ -59,7 +63,9 @@ async def get_market_data():
                     df['timestamp'] = df['timestamp'].dt.tz_localize('UTC').dt.tz_convert(LOCAL_TIMEZONE)
                     
                     df = df.rename(columns={'timestamp': 'close_time'})
-                    df = df.tail(30).reset_index(drop=True)
+                    
+                    # Берем последние 50 точек (это будет 50 минут истории)
+                    df = df.tail(50).reset_index(drop=True)
                     return df
                 else:
                     logging.error(f"Ошибка CoinGecko HTTP: {response.status}")
@@ -123,13 +129,11 @@ def predict_next_minute(df):
     predicted_price_full = scaler.inverse_transform(dummy_array)
     predicted_price = predicted_price_full[0, 0]
 
-    # --- ИСПРАВЛЕНИЕ ВРЕМЕНИ (Real Time) ---
-    # Мы не используем время из API для прогноза, так как оно может запаздывать.
-    # Мы берем текущее время системы и приводим его к нужной зоне.
+    # --- ВРЕМЯ ПРОГНОЗА ---
     now_utc = datetime.now(timezone.utc)
     now_local = now_utc.astimezone(LOCAL_TIMEZONE)
     
-    # Прогноз на следующую минуту (округляем текущую + 1 мин)
+    # Прогноз на следующую минуту
     next_time = now_local.replace(second=0, microsecond=0) + timedelta(minutes=1)
 
     return df, predicted_price, next_time
@@ -138,13 +142,13 @@ def create_plot(df, predicted_price, next_time):
     plt.style.use('dark_background')
     fig, ax = plt.subplots(figsize=(10, 6))
 
-    plot_df = df.tail(10).copy()
+    # Отрисовываем последние 20 точек (20 минут)
+    plot_df = df.tail(20).copy()
     
-    # Убираем timezone для отрисовки в matplotlib, но само значение времени уже локальное (МСК)
+    # Убираем timezone для отрисовки
     plot_df['close_time_plot'] = plot_df['close_time'].dt.tz_localize(None)
     
-    # Обработка next_time (это стандартный datetime, а не Pandas Series)
-    # Нам нужно заменить timezone_info на None для отрисовки
+    # Обработка next_time
     if next_time.tzinfo is not None:
         next_time_plot = next_time.replace(tzinfo=None)
     else:
@@ -168,7 +172,7 @@ def create_plot(df, predicted_price, next_time):
                 xytext=(0,10), ha='center', fontsize=9, color='lime', fontweight='bold')
 
     ax.set_title(f"BTC/USDT AI Prediction ({TIMEZONE_STR})", color='white', fontsize=14)
-    ax.set_xlabel("Время", color='gray')
+    ax.set_xlabel("Время", color='gray")
     ax.set_ylabel("Цена ($)", color='gray')
     
     ax.grid(True, color='gray', linestyle=':', alpha=0.5)
@@ -209,7 +213,8 @@ async def cmd_start(message: types.Message):
     await message.answer(
         "👋 Добро пожаловать в AI BTC Predictor!\n\n"
         "Я анализирую рынок с помощью нейросети и выдаю краткосрочный прогноз.\n"
-        f"Часовой пояс: {TIMEZONE_STR}.",
+        f"Часовой пояс: {TIMEZONE_STR}.\n"
+        "Таймфрейм: 1 минута.",
         reply_markup=main_keyboard
     )
 
@@ -217,7 +222,7 @@ async def cmd_start(message: types.Message):
 async def cmd_info(message: types.Message):
     await message.answer(
         f"📊 **Как это работает:**\n"
-        f"1. Источник: CoinGecko.\n"
+        f"1. Источник: CoinGecko (1 мин таймфрейм).\n"
         f"2. Время прогноза: Текущее локальное ({TIMEZONE_STR}).\n\n"
         "⚠️ *Не финансовый совет.*",
         parse_mode="Markdown"
