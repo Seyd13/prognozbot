@@ -2,7 +2,7 @@ import sys
 import os
 import telebot
 import numpy as np
-import requests # Заменили websockets на requests
+import requests 
 import matplotlib
 matplotlib.use('Agg') 
 import matplotlib.pyplot as plt
@@ -49,7 +49,7 @@ def get_moscow_time():
 # --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
 chart_data_buffer = deque(maxlen=20) 
 current_symbol = None
-stop_http_flag = False # Переименовали флаг
+stop_http_flag = False
 current_chat_id = None
 is_busy = False
 
@@ -66,14 +66,11 @@ asset_keyboard.row(telebot.types.KeyboardButton("SOLUSDT"))
 asset_keyboard.row(telebot.types.KeyboardButton("Назад"))
 
 # --- ЛОГИКА ПОЛУЧЕНИЯ ЦЕНЫ (HTTP) ---
-# Используем HTTP вместо WebSocket, чтобы избежать блокировки по IP (ошибка 451)
 
 def binance_http_logic(symbol, chat_id):
-    """Получает цену через HTTP запросы в цикле"""
     global chart_data_buffer, current_symbol, stop_http_flag, is_busy
     
     current_symbol = symbol.lower()
-    # API для получения цены
     url = f"https://api.binance.com/api/v3/ticker/price?symbol={current_symbol.upper()}"
     chart_data_buffer.clear()
     
@@ -83,29 +80,24 @@ def binance_http_logic(symbol, chat_id):
         
         while not stop_http_flag:
             try:
-                # Делаем запрос с таймаутом
                 response = requests.get(url, timeout=5)
                 if response.status_code == 200:
                     data = response.json()
                     close_price = float(data['price'])
                     
-                    # Сохраняем цену и московское время
                     current_time = get_moscow_time()
                     chart_data_buffer.append({'price': close_price, 'time': current_time})
-                    
-                    # logger.info(f"Получена цена: {close_price}") # Можно раскомментировать для отладки
                     
                     if not prediction_sent and len(chart_data_buffer) >= 12:
                         logger.info("Данных достаточно, отправляем прогноз...")
                         threading.Thread(target=send_prediction, args=(chat_id,)).start()
                         prediction_sent = True
                 
-                # Пауза 1 секунда, чтобы не спамить API
                 time.sleep(1)
                 
             except requests.exceptions.RequestException as e:
                 logger.error(f"Ошибка запроса к Binance: {e}")
-                time.sleep(5) # Пауза при ошибке
+                time.sleep(5)
     except Exception as e:
         logger.error(f"Критическая ошибка потока: {e}")
     finally:
@@ -116,7 +108,6 @@ def run_http_thread(symbol, chat_id):
     global stop_http_flag
     stop_http_flag = False
     
-    # Запускаем в отдельном потоке (здесь не нужен asyncio)
     http_thread = threading.Thread(target=binance_http_logic, args=(symbol, chat_id))
     http_thread.daemon = True
     http_thread.start()
@@ -232,11 +223,9 @@ def process_symbol_selection(message):
     
     is_busy = True
     
-    # Останавливаем старый поток
     stop_http_flag = True
     time.sleep(0.5) 
     
-    # Запускаем новый
     run_http_thread(symbol, current_chat_id)
     
     bot.send_message(message.chat.id, f"✅ Запустил анализ {symbol}.\n⏳ График придет через 10-15 сек...", reply_markup=main_keyboard)
@@ -269,6 +258,9 @@ if __name__ == '__main__':
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.daemon = True 
     flask_thread.start()
+    
+    # Небольшая пауза перед стартом бота, чтобы избежать конфликта 409 при быстром рестарте
+    time.sleep(2) 
     
     logger.info("Бот запущен...")
     logger.info(f"Flask сервер запущен на порту {PORT}")
