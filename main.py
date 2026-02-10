@@ -1,271 +1,307 @@
-import sys
-import os
-import telebot
-import numpy as np
-import requests 
-import matplotlib
-matplotlib.use('Agg') 
-import matplotlib.pyplot as plt
-import io
+import asyncio
 import logging
-import threading
-import time
-from collections import deque
-from sklearn.linear_model import LinearRegression
-from sklearn.preprocessing import PolynomialFeatures
-from datetime import datetime, timedelta, timezone
-from flask import Flask
+import os
+from datetime import datetime, timedelta
+import aiohttp
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from io import BytesIO
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from sklearn.neural_network import MLPRegressor
+from sklearn.preprocessing import MinMaxScaler
 
 # --- КОНФИГУРАЦИЯ ---
+# ВАЖНО: Замените этот токен на новый после деплоя!
 TELEGRAM_TOKEN = "2122435147:AAG_52ELCHjFnXNxcAP4i5xNAal9I91xNTM"
-PORT = int(os.environ.get('PORT', 8080))
 
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
 
-# --- НАСТРОЙКА ЛОГГИРОВАНИЯ ---
-logging.basicConfig(
-    level=logging.INFO, 
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    stream=sys.stdout
-)
-logger = logging.getLogger(__name__)
+# Инициализация бота и диспетчера
+bot = Bot(token=TELEGRAM_TOKEN)
+dp = Dispatcher()
 
-# --- FLASK ДЛЯ RAILWAY ---
-app = Flask(__name__)
+# Глобальный флаг для защиты от спама (один прогноз за раз)
+is_predicting = False
 
-@app.route('/')
-def index():
-    return "Bot is alive"
+# --- ФУНКЦИИ ДАННЫХ И ИНДИКАТОРОВ ---
 
-def run_flask():
-    app.run(host='0.0.0.0', port=PORT, use_reloader=False)
+async def get_binance_klines(interval='1m', limit=20):
+    """Получает данные свечей с Binance."""
+    url = f"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval={interval}&limit={limit}"
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as response:
+            if response.status == 200:
+                data = await response.json()
+                # Преобразуем в DataFrame: [Time, Open, High, Low, Close, Volume, ...]
+                df = pd.DataFrame(data, columns=[
+                    'open_time', 'open', 'high', 'low', 'close', 'volume',
+                    'close_time', 'quote_volume', 'trades', 'taker_buy_base',
+                    'taker_buy_quote', 'ignore'
+                ])
+                # Конвертируем типы
+                df['close_time'] = pd.to_datetime(df['close_time'], unit='ms')
+                df['close'] = pd.to_numeric(df['close'])
+                return df[['close_time', 'close']]
+            else:
+                logging.error(f"Ошибка Binance API: {response.status}")
+                return None
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+def calculate_rsi(series, period=14):
+    """Расчет RSI."""
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
 
-def get_moscow_time():
-    moscow_tz = timezone(timedelta(hours=3))
-    return datetime.now(moscow_tz)
+# --- ФУНКЦИИ МОДЕЛИ И ПРЕДСКАЗАНИЯ ---
 
-# --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
-chart_data_buffer = deque(maxlen=20) 
-current_symbol = None
-stop_http_flag = False
-current_chat_id = None
-is_busy = False
+def predict_next_minute(df):
+    """
+    Готовит данные, обучает легкую нейросеть и делает прогноз.
+    """
+    # 1. Добавляем RSI
+    df = df.copy()
+    df['rsi'] = calculate_rsi(df['close'])
+    df.dropna(inplace=True)
 
-# --- КЛАВИАТУРЫ ---
-main_keyboard = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
-main_keyboard.add(telebot.types.KeyboardButton("Прогноз цены"))
-
-asset_keyboard = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
-asset_keyboard.row(telebot.types.KeyboardButton("BTCUSDT"))
-asset_keyboard.row(telebot.types.KeyboardButton("ETHUSDT"))
-asset_keyboard.row(telebot.types.KeyboardButton("BNBUSDT"))
-asset_keyboard.row(telebot.types.KeyboardButton("ADAUSDT"))
-asset_keyboard.row(telebot.types.KeyboardButton("SOLUSDT"))
-asset_keyboard.row(telebot.types.KeyboardButton("Назад"))
-
-# --- ЛОГИКА ПОЛУЧЕНИЯ ЦЕНЫ (HTTP) ---
-
-def binance_http_logic(symbol, chat_id):
-    global chart_data_buffer, current_symbol, stop_http_flag, is_busy
-    
-    current_symbol = symbol.lower()
-    url = f"https://api.binance.com/api/v3/ticker/price?symbol={current_symbol.upper()}"
-    chart_data_buffer.clear()
-    
-    try:
-        logger.info(f"Запущен HTTP мониторинг для {symbol}")
-        prediction_sent = False
-        
-        while not stop_http_flag:
-            try:
-                response = requests.get(url, timeout=5)
-                if response.status_code == 200:
-                    data = response.json()
-                    close_price = float(data['price'])
-                    
-                    current_time = get_moscow_time()
-                    chart_data_buffer.append({'price': close_price, 'time': current_time})
-                    
-                    if not prediction_sent and len(chart_data_buffer) >= 12:
-                        logger.info("Данных достаточно, отправляем прогноз...")
-                        threading.Thread(target=send_prediction, args=(chat_id,)).start()
-                        prediction_sent = True
-                
-                time.sleep(1)
-                
-            except requests.exceptions.RequestException as e:
-                logger.error(f"Ошибка запроса к Binance: {e}")
-                time.sleep(5)
-    except Exception as e:
-        logger.error(f"Критическая ошибка потока: {e}")
-    finally:
-        logger.info("HTTP поток завершил работу.")
-        is_busy = False
-
-def run_http_thread(symbol, chat_id):
-    global stop_http_flag
-    stop_http_flag = False
-    
-    http_thread = threading.Thread(target=binance_http_logic, args=(symbol, chat_id))
-    http_thread.daemon = True
-    http_thread.start()
-
-# --- ЛОГИКА ПРОГНОЗА ---
-
-def predict_price(data_buffer):
-    if len(data_buffer) < 10:
+    # Если данных мало после RSI, берем простую разницу
+    if len(df) < 5:
+        logging.warning("Недостаточно данных после очистки NaN")
         return None, None
-    
-    recent_data = list(data_buffer)[-10:] 
-    prices = [d['price'] for d in recent_data]
-    
-    X = np.arange(len(prices)).reshape(-1, 1)
-    y = prices
-    
-    poly = PolynomialFeatures(degree=2)
-    X_poly = poly.fit_transform(X)
-    model = LinearRegression()
-    model.fit(X_poly, y)
-    
-    next_point = np.array([[len(prices)]])
-    next_point_poly = poly.transform(next_point)
-    predicted_close = model.predict(next_point_poly)[0]
-    score = model.score(X_poly, y)
-    
-    return predicted_close, score
 
-def create_price_chart(data_buffer, predicted_close=None):
-    plt.figure(figsize=(10, 5))
+    # 2. Подготовка признаков (Features)
+    # Используем цену и RSI как входные данные
+    data = df[['close', 'rsi']].values
     
-    last_points = list(data_buffer)[-20:] 
-    prices = [d['price'] for d in last_points]
-    timestamps = [d['time'] for d in last_points]
-    
-    time_labels = [t.strftime('%H:%M:%S') for t in timestamps]
-    x_values = range(len(last_points))
-    
-    plt.plot(x_values, prices, 'bo-', linewidth=1.5, markersize=5, label='Цены закрытия')
-    plt.xticks(x_values, time_labels, rotation=45, ha='right', fontsize=8)
-    
-    if predicted_close is not None:
-        next_x = len(last_points)
-        plt.plot(next_x, predicted_close, 'ro', markersize=8, label='Прогноз')
-        plt.text(next_x, predicted_close, f'{predicted_close:.2f}', ha='center', va='bottom', fontsize=10, color='red', fontweight='bold')
-        plt.plot([x_values[-1], next_x], [prices[-1], predicted_close], 'r--', alpha=0.5)
-        
-        last_time = timestamps[-1]
-        pred_time = last_time + timedelta(minutes=1)
-        pred_time_label = pred_time.strftime('%H:%M:%S')
-        plt.xticks(list(x_values) + [next_x], time_labels + [pred_time_label], rotation=45, ha='right', fontsize=8)
+    # Нормализация (важно для нейросетей)
+    scaler = MinMaxScaler()
+    scaled_data = scaler.fit_transform(data)
 
-    display_symbol = f"{current_symbol.upper()[:3]}/{current_symbol.upper()[3:]}" if current_symbol else "АКТИВ"
-    plt.title(f'Прогноз цены {display_symbol}')
-    plt.xlabel('Время (Москва)')
-    plt.ylabel('Цена (USDT)')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
+    # Формируем X (последние 10 точек) и y (следующая точка)
+    # Для обучения используем скользящее окно
+    X, y = [], []
+    look_back = 10
+    if len(scaled_data) <= look_back:
+        return None, None
+
+    for i in range(len(scaled_data) - look_back):
+        X.append(scaled_data[i:i + look_back].flatten()) # Разворачиваем окно в вектор
+        y.append(scaled_data[i + look_back][0]) # Предсказываем только цену (индекс 0)
+
+    if not X:
+        return None, None
+
+    X = np.array(X)
+    y = np.array(y)
+
+    # 3. Обучение легкой модели (MLPRegressor)
+    # Это небольшая нейросеть, которая учится прямо "на лету"
+    model = MLPRegressor(hidden_layer_sizes=(10, 5), max_iter=500, random_state=42)
+    try:
+        model.fit(X, y)
+    except Exception as e:
+        logging.error(f"Ошибка обучения модели: {e}")
+        return None, None
+
+    # 4. Предсказание
+    # Берем последние look_back точек для прогноза на 1 минуту вперед
+    last_window = scaled_data[-look_back:].flatten().reshape(1, -1)
+    predicted_scaled = model.predict(last_window)
     
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png')
+    # Денормализация цены
+    # Создаем фиктивный массив с 0 для RSI, чтобы scaler вернул только цену
+    dummy_array = np.zeros((1, 2))
+    dummy_array[0, 0] = predicted_scaled[0]
+    predicted_price = scaler.inverse_transform(dummy_array)[0, 0]
+
+    # Время следующей минуты
+    last_time = df['close_time'].iloc[-1]
+    next_time = last_time + timedelta(minutes=1)
+
+    return df, predicted_price, next_time
+
+# --- ГЕНЕРАЦИЯ ГРАФИКА ---
+
+def create_plot(df, predicted_price, next_time):
+    """
+    Рисует график: 10 предыдущих минут + 1 предсказанная.
+    """
+    plt.style.use('dark_background')
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    # Берем только последние 10 точек для чистоты графика (или сколько есть)
+    plot_df = df.tail(10).copy()
+    
+    # График истории
+    ax.plot(plot_df['close_time'], plot_df['close'], 
+            label='История', color='cyan', marker='o', linestyle='-')
+
+    # График предсказания
+    # Соединяем последнюю точку истории с предсказанием
+    ax.plot([plot_df['close_time'].iloc[-1], next_time],
+            [plot_df['close'].iloc[-1], predicted_price],
+            label='Прогноз AI', color='lime', linestyle='--', marker='x')
+    
+    # Точки предсказания
+    ax.scatter(next_time, predicted_price, color='lime', s=100, zorder=5)
+
+    # Подписи точек (Цена и Время)
+    for x, y in zip(plot_df['close_time'], plot_df['close']):
+        label = f"{y:.0f}\n{x.strftime('%H:%M')}"
+        ax.annotate(label, (x, y), textcoords="offset points", xytext=(0,10), ha='center', fontsize=8, color='white')
+
+    # Подпись предсказания
+    ax.annotate(f"AI: {predicted_price:.0f}\n{next_time.strftime('%H:%M')}", 
+                (next_time, predicted_price), textcoords="offset points", 
+                xytext=(0,10), ha='center', fontsize=9, color='lime', fontweight='bold')
+
+    # Форматирование
+    ax.set_title(f"BTC/USDT Прогноз на минуту", color='white', fontsize=14)
+    ax.set_xlabel("Время", color='gray')
+    ax.set_ylabel("Цена ($)", color='gray')
+    ax.grid(True, color='gray', linestyle=':', alpha=0.5)
+    ax.legend()
+    
+    # Формат оси времени
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+    fig.autofmt_xdate()
+
+    # Сохранение в буфер
+    buf = BytesIO()
+    plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+    plt.close(fig)
     buf.seek(0)
-    plt.close()
     return buf
 
-def send_prediction(chat_id):
-    try:
-        if len(chart_data_buffer) < 10:
-            return
-        predicted_close, score = predict_price(chart_data_buffer)
-        if predicted_close is None:
-            return
-            
-        chart_buffer = create_price_chart(chart_data_buffer, predicted_close)
-        
-        display_symbol = f"{current_symbol.upper()[:3]}/{current_symbol.upper()[3:]}" if current_symbol else "АКТИВ"
-        last_price = list(chart_data_buffer)[-1]['price']
-        
-        direction_icon = "📈" if predicted_close > last_price else "📉"
-        response_text = (
-            f"{direction_icon} **Прогноз для {display_symbol}**\n\n"
-            f"📊 Точность модели (R²): {score:.2%}\n"
-            f"🕒 Текущая цена: {last_price:.2f}\n"
-            f"🎯 Ожидаемая цена: {predicted_close:.2f}\n\n"
-            f"💡 *Не финансовая рекомендация.*"
-        )
-        
-        bot.send_photo(chat_id, chart_buffer, caption=response_text, parse_mode='Markdown', reply_markup=main_keyboard)
-    except Exception as e:
-        logger.error(f"Ошибка отправки: {e}")
+# --- ХЕНДЛЕРЫ БОТА ---
 
-# --- ХЕНДЛЕРЫ ---
+@dp.startup()
+async def on_startup():
+    logging.info("Бот запущен. Нажмите /start чтобы начать.")
 
-@bot.message_handler(commands=['start', 'help'])
-def send_welcome(message):
-    bot.send_message(message.chat.id, "🤖 Выберите монету, и я пришлю прогноз автоматически.", reply_markup=main_keyboard)
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    kb = [
+        [InlineKeyboardButton(text="🔮 Получить прогноз BTC", callback_data="predict_btc")],
+        [InlineKeyboardButton(text="ℹ️ Как работает бот?", callback_data="help_info")]
+    ]
+    keyboard = InlineKeyboardMarkup(inline_keyboard=kb)
+    await message.answer(
+        "👋 Привет! Я AI-бот для прогнозирования цены Bitcoin.\n\n"
+        "Я анализирую данные в реальном времени, использую нейросеть и RSI индикатор, "
+        "чтобы предсказать цену закрытия следующей минутной свечи.\n\n"
+        "Нажмите кнопку ниже, чтобы получить прогноз.",
+        reply_markup=keyboard
+    )
 
-@bot.message_handler(func=lambda message: message.text == "Прогноз цены")
-def ask_for_symbol(message):
-    bot.send_message(message.chat.id, "Выберите актив:", reply_markup=asset_keyboard)
+@dp.callback_query(F.data == "help_info")
+async def show_help(callback: types.CallbackQuery):
+    await callback.message.edit_text(
+        "📊 **Как это работает:**\n"
+        "1. Я получаю данные с биржи Binance (минутный график).\n"
+        "2. Рассчитываю индекс RSI (Relative Strength Index).\n"
+        "3. Обучаю легкую нейросеть (MLP) на последних данных.\n"
+        "4. Рисую график с 10 минутами истории и 1 минутой прогноза.\n\n"
+        "⚠️ Это не финансовая рекомендация, а демонстрация возможностей AI.",
+        parse_mode="Markdown"
+    )
+    await callback.answer()
 
-@bot.message_handler(func=lambda message: message.text in ["BTCUSDT", "ETHUSDT", "BNBUSDT", "ADAUSDT", "SOLUSDT"])
-def process_symbol_selection(message):
-    global stop_http_flag, current_chat_id, is_busy
-    
-    if is_busy:
-        bot.send_message(message.chat.id, "⏳ Подождите, я обрабатываю предыдущий запрос...", reply_markup=asset_keyboard)
+@dp.callback_query(F.data == "predict_btc")
+async def process_prediction(callback: types.CallbackQuery):
+    global is_predicting
+
+    if is_predicting:
+        await callback.answer("⏳ В данный момент я уже высчитываю прогноз. Пожалуйста, подождите.", show_alert=True)
         return
 
-    symbol = message.text
-    current_chat_id = message.chat.id
-    
-    is_busy = True
-    
-    stop_http_flag = True
-    time.sleep(0.5) 
-    
-    run_http_thread(symbol, current_chat_id)
-    
-    bot.send_message(message.chat.id, f"✅ Запустил анализ {symbol}.\n⏳ График придет через 10-15 сек...", reply_markup=main_keyboard)
+    is_predicting = True
+    await callback.message.edit_text("⏳ Получаю данные с биржи и обучаю модель... Это займет несколько секунд.")
 
-@bot.message_handler(func=lambda message: message.text == "Назад")
-def go_back_to_main(message):
-    global stop_http_flag, current_symbol, chart_data_buffer, current_chat_id, is_busy
-    
-    stop_http_flag = True
-    current_symbol = None
-    chart_data_buffer.clear()
-    current_chat_id = None
-    is_busy = False
-    
-    bot.send_message(message.chat.id, "🛑 Отслеживание остановлено.", reply_markup=main_keyboard)
-
-@bot.message_handler(func=lambda message: True)
-def handle_text(message):
-    if current_symbol is None:
-        bot.send_message(message.chat.id, "Выберите монету через меню.", reply_markup=main_keyboard)
-    elif len(chart_data_buffer) > 0:
-        last_price = list(chart_data_buffer)[-1]['price']
-        display_symbol = f"{current_symbol.upper()[:3]}/{current_symbol.upper()[3:]}"
-        bot.send_message(message.chat.id, f"Текущая цена {display_symbol}: {last_price}", reply_markup=main_keyboard)
-    else:
-        bot.send_message(message.chat.id, "Собираю данные...", reply_markup=main_keyboard)
-
-if __name__ == '__main__':
-    # Запускаем Flask в отдельном потоке
-    flask_thread = threading.Thread(target=run_flask)
-    flask_thread.daemon = True 
-    flask_thread.start()
-    
-    # Небольшая пауза перед стартом бота, чтобы избежать конфликта 409 при быстром рестарте
-    time.sleep(2) 
-    
-    logger.info("Бот запущен...")
-    logger.info(f"Flask сервер запущен на порту {PORT}")
-    
     try:
-        bot.infinity_polling(timeout=10, long_polling_timeout=5)
+        # 1. Получаем данные
+        df_raw = await get_binance_klines(limit=30) # Берем чуть больше для расчета RSI корректно
+        if df_raw is None:
+            await callback.message.edit_text("❌ Не удалось получить данные от Binance. Попробуйте позже.")
+            return
+
+        # 2. Предсказываем
+        df_processed, pred_price, next_time = predict_next_minute(df_raw)
+        
+        if pred_price is None:
+            await callback.message.edit_text("❌ Не удалось построить модель (мало данных).")
+            return
+
+        # 3. Рисуем график
+        plot_buf = create_plot(df_processed, pred_price, next_time)
+
+        # 4. Отправляем результат
+        current_price = df_processed['close'].iloc[-1]
+        diff = pred_price - current_price
+        emoji = "📈" if diff > 0 else "📉"
+        
+        caption = (
+            f"{emoji} **Прогноз BTC/USDT**\n\n"
+            f"Текущая цена: `{current_price:.2f}` $\n"
+            f"Прогноз на {next_time.strftime('%H:%M')}: `{pred_price:.2f}` $\n\n"
+            f"Изменение: `{diff:.2f}` $"
+        )
+
+        # Клавиатура "Еще раз"
+        kb = [[InlineKeyboardButton(text="🔄 Обновить прогноз", callback_data="predict_btc")]]
+        keyboard = InlineKeyboardMarkup(inline_keyboard=kb)
+
+        await callback.message.delete()
+        await bot.send_photo(
+            chat_id=callback.message.chat.id,
+            photo=plot_buf,
+            caption=caption,
+            parse_mode="Markdown",
+            reply_markup=keyboard
+        )
+
     except Exception as e:
-        logger.error(f"Критический сбой: {e}")
+        logging.error(f"Ошибка в процессе прогноза: {e}")
+        await callback.message.edit_text("❌ Произошла ошибка при обработке запроса.")
+    finally:
+        is_predicting = False
+
+# --- ЗАЩИТА ОТ СПАМА И ЛИШНИХ СООБЩЕНИЙ ---
+
+@dp.message()
+async def handle_spam(message: types.Message):
+    """
+    Обрабатывает все сообщения, которые не являются командами или колбэками.
+    """
+    ignore_phrases = ["привет", "здравствуй", "хай", "что делаешь", "кто ты"]
+    text = message.text.lower() if message.text else ""
+    
+    # Если это похоже на просто болтовню - игнорируем или шлем подсказку
+    # Если бот сейчас занят (is_predicting), то блокируем жестче
+    if is_predicting:
+        return # Молчаливое игнорирование, чтобы не засорять чат во время расчетов
+
+    # Иначе вежливо подсказываем
+    await message.answer(
+        "😕 Я понимаю только команды из меню.\n"
+        "Пожалуйста, используйте кнопки или команду /start."
+    )
+
+# --- ЗАПУСК ---
+
+async def main():
+    # Удаляем вебхуки, чтобы бот мог работать в Long Polling (для Railway можно и вебхук, но LP проще для отладки)
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
