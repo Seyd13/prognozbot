@@ -40,7 +40,8 @@ user_limits = defaultdict(lambda: {'balance': STARTING_BALANCE, 'last_prediction
 async def get_market_data():
     """
     Получает данные с CoinGecko API.
-    ИСПРАВЛЕНО: days=1 дает 5-минутные свечи (точки) за последние сутки.
+    ИСПРАВЛЕНИЕ: days=1 дает данные за сутки. 
+    Мы делаем ресемплирование (resample), чтобы выровнять точки ровно по 5 минут.
     """
     url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=1"
     
@@ -59,10 +60,26 @@ async def get_market_data():
 
                     df = pd.DataFrame(prices, columns=['timestamp', 'close'])
                     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                    
+                    # --- КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ ВРЕМЕНИ ---
+                    # 1. Устанавливаем timestamp как индекс
+                    df.set_index('timestamp', inplace=True)
+                    
+                    # 2. Ресемплируем в 5-минутные свечи ('5T').
+                    # Это создает строгие интервалы: 13:00, 13:05, 13:10 и т.д.
+                    # agg({'close': 'last'}) берет последнюю цену в 5-минутном окне.
+                    df = df.resample('5T').agg({'close': 'last'})
+                    
+                    # 3. Удаляем пустые строки (если данных не было)
+                    df.dropna(inplace=True)
+                    
+                    # 4. Возвращаем timestamp в колонку и конвертируем часовой пояс
+                    df.reset_index(inplace=True)
                     df['timestamp'] = df['timestamp'].dt.tz_localize('UTC').dt.tz_convert(LOCAL_TIMEZONE)
                     
                     df = df.rename(columns={'timestamp': 'close_time'})
-                    # Берем последние 60 точек (сейчас это 5 часов истории при 5-мин таймфрейме)
+                    
+                    # Берем последние 60 свечей (5 часов истории)
                     df = df.tail(60).reset_index(drop=True)
                     return df
                 else:
@@ -84,6 +101,9 @@ def calculate_rsi(series, period=14):
     return rsi
 
 def predict_next_5min(df):
+    """
+    Предсказывает СЛЕДУЮЩУЮ 5-минутную свечу.
+    """
     df = df.copy()
     df['rsi'] = calculate_rsi(df['close'])
     df['change'] = df['close'].diff()
@@ -97,15 +117,14 @@ def predict_next_5min(df):
     scaled_data = scaler.fit_transform(data)
 
     X, y = [], []
-    look_back = 10
+    look_back = 10 # Смотрим на 10 свечей назад (50 минут)
     
     if len(scaled_data) <= look_back:
         return None, None, None
 
-    # Подготовка данных для обучения (предсказываем следующую точку)
     for i in range(len(scaled_data) - look_back):
         X.append(scaled_data[i:i + look_back].flatten()) 
-        y.append(scaled_data[i + look_back][0]) # Предсказываем только цену (индекс 0)
+        y.append(scaled_data[i + look_back][0]) 
 
     if not X:
         return None, None, None
@@ -120,58 +139,22 @@ def predict_next_5min(df):
         logging.error(f"Ошибка обучения модели: {e}")
         return None, None, None
 
-    # Рекурсивное предсказание на 5 шагов вперед (5 минут)
-    current_window = scaled_data[-look_back:].flatten().reshape(1, -1)
+    last_window = scaled_data[-look_back:].flatten().reshape(1, -1)
+    predicted_scaled = model.predict(last_window)[0]
     
-    # Для рекурсивного предсказания нам нужно обновлять признаки (RSI, change) фиктивно или упрощенно.
-    # Самый простой способ для краткосрочного прогноза: предсказать 1 шаг и сдвинуть окно, 
-    # но так как мы не знаем будущий RSI точно, мы берем последнее известное значение признаков.
-    
-    predicted_scaled = model.predict(current_window)[0]
-    
-    # Обновляем окно для следующего шага (сдвиг влево, добавление предсказания)
-    # Для простоты считаем, что RSI и change не меняются мгновенно (берем последние)
-    # Признаки: [price, rsi, change]
-    
-    # Прогнозируем на 5 шагов вперед рекурсивно
-    future_predictions = []
-    temp_window = current_window[0].tolist() # flatten list
-    
-    for _ in range(5):
-        # Предсказываем цену
-        pred_price_scaled = model.predict([temp_window[-look_back*3:]])[0] # Берем последние look_back*3 значений (flattened)
-        future_predictions.append(pred_price_scaled)
-        
-        # Обновляем окно (добавляем предсказанную цену, rsi и change оставляем как у последнего известного для стабильности)
-        # В реальности это упрощение, но для 5 минут приемлемо.
-        last_known_rsi = temp_window[-2]
-        last_known_change = temp_window[-1]
-        
-        # Добавляем новые данные в конец окна (simulating rolling)
-        # Внимание: размер окна должен оставаться look_back*3 для flatten вектора
-        # Удаляем первые 3 элемента (старая точка), добавляем новые 3
-        new_point = [pred_price_scaled, last_known_rsi, last_known_change]
-        temp_window = temp_window[3:] + new_point
-
-    # Берем прогноз на 5-ю минуту (последний элемент)
-    final_pred_scaled = future_predictions[-1]
-    
-    # Обратное масштабирование только для цены
+    # Обратное масштабирование
     dummy_array = np.zeros((1, 3))
-    dummy_array[0, 0] = final_pred_scaled
+    dummy_array[0, 0] = predicted_scaled
     dummy_array[0, 1] = scaled_data[-1, 1] 
     dummy_array[0, 2] = scaled_data[-1, 2] 
     
     predicted_price_full = scaler.inverse_transform(dummy_array)
     predicted_price = predicted_price_full[0, 0]
 
-    # Real Time Logic
-    now_utc = datetime.now(timezone.utc)
-    now_local = now_utc.astimezone(LOCAL_TIMEZONE)
-    
-    # Следующая точка данных от CoinGecko придет через 5 минут (или уже есть текущая 5-минутка)
-    # Мы хотим предсказать цену через 5 минут от СЕЙЧАС.
-    next_time = now_local.replace(second=0, microsecond=0) + timedelta(minutes=5)
+    # --- ЛОГИКА ВРЕМЕНИ ПРОГНОЗА ---
+    # Берем время последней свечи в данных и прибавляем ровно 5 минут.
+    last_time = df['close_time'].iloc[-1]
+    next_time = last_time + timedelta(minutes=5)
 
     return df, predicted_price, next_time
 
@@ -179,7 +162,7 @@ def create_plot(df, predicted_price, next_time):
     plt.style.use('dark_background')
     fig, ax = plt.subplots(figsize=(12, 8))
     
-    # Берем последние 20 точек (100 минут / 1.5 часа) для отображения
+    # Берем последние 20 свечей (100 минут)
     plot_df = df.tail(20).copy()
     
     plot_df['close_time_plot'] = plot_df['close_time'].dt.tz_localize(None)
@@ -197,40 +180,33 @@ def create_plot(df, predicted_price, next_time):
     # Точка прогноза
     ax.scatter(next_time_plot, predicted_price, color='lime', s=200, zorder=3, edgecolors='white')
 
-    # --- ОТРИСОВКА ТЕКСТА НА ТОЧКАХ ---
+    # --- ОТРИСОВКА ТЕКСТА ---
     
-    # 1. Для исторических точек
+    # Исторические точки
     for x, y, time_obj in zip(plot_df['close_time_plot'], plot_df['close'], plot_df['close_time']):
         time_str = time_obj.strftime('%H:%M')
         price_str = f"{y:.0f}"
         
-        # Время (ЧЧ:ММ) СВЕРХУ точки
         ax.annotate(time_str, (x, y), textcoords="offset points", xytext=(0,12), 
                     ha='center', fontsize=9, color='yellow', fontweight='bold')
-        
-        # Цена (снизу) точки
         ax.annotate(price_str, (x, y), textcoords="offset points", xytext=(0,-12), 
                     ha='center', fontsize=8, color='white')
 
-    # 2. Для точки прогноза
+    # Точка прогноза
     pred_time_str = next_time.strftime('%H:%M')
     pred_price_str = f"{predicted_price:.0f}"
     
-    # Время прогноза
     ax.annotate(pred_time_str, (next_time_plot, predicted_price), textcoords="offset points", xytext=(0,15), 
                 ha='center', fontsize=10, color='lime', fontweight='bold')
-    # Цена прогноза
     ax.annotate(pred_price_str, (next_time_plot, predicted_price), textcoords="offset points", xytext=(0,-15), 
                 ha='center', fontsize=9, color='lime', fontweight='bold')
 
-    # УБИРАЕМ ОСЬ X (шкалу времени внизу), так как она не нужна
     ax.get_xaxis().set_visible(False)
     
     ax.set_title(f"BTC/USDT AI Prediction (5m TF) ({TIMEZONE_STR})", color='white', fontsize=16)
     ax.set_ylabel("Цена ($)", color='gray')
     ax.grid(True, color='gray', linestyle=':', alpha=0.3)
     
-    # Убираем легенду, чтобы не мешала
     ax.legend(['История', 'Прогноз AI'], loc='upper left')
 
     buf = BytesIO()
@@ -262,9 +238,8 @@ async def cmd_start(message: types.Message):
         user_limits[user_id] = {'balance': STARTING_BALANCE, 'last_prediction_time': None}
     await message.answer(
         "👋 Добро пожаловать в AI BTC Predictor!\n\n"
-        "Я анализирую рынок с помощью нейросети и выдаю прогноз.\n"
-        f"Часовой пояс: {TIMEZONE_STR}.\n"
-        "Таймфрейм: 5 минут.",
+        "Анализ рынка с таймфреймом 5 минут.\n"
+        f"Часовой пояс: {TIMEZONE_STR}.",
         reply_markup=main_keyboard
     )
 
@@ -272,8 +247,8 @@ async def cmd_start(message: types.Message):
 async def cmd_info(message: types.Message):
     await message.answer(
         f"📊 **Как это работает:**\n"
-        f"1. Источник: CoinGecko (5 мин таймфрейм).\n"
-        f"2. Время прогноза: Через 5 минут ({TIMEZONE_STR}).\n\n"
+        f"1. Данные выравниваются по 5-минутным свечам (13:00, 13:05...).\n"
+        f"2. Прогноз дается на следующую 5-минутную свечу.\n\n"
         "⚠️ *Не финансовый совет.*",
         parse_mode="Markdown"
     )
@@ -297,23 +272,23 @@ async def cmd_predict(message: types.Message):
     last_time = user_limits[user_id]['last_prediction_time']
     if last_time:
         now = datetime.now(LOCAL_TIMEZONE)
-        # Ограничение: 1 прогноз в 5 минут (так как таймфрейм 5 минут)
+        # Ограничение 5 минут
         if (now - last_time).total_seconds() < 300:
-            remain = 300 - (now - last_time).total_seconds()
-            await message.answer(f"⏳ Пожалуйста, подождите {int(remain)} секунд перед новым запросом.")
+            remain = int(300 - (now - last_time).total_seconds())
+            await message.answer(f"⏳ Подождите {remain} сек перед новым запросом.")
             return
 
-    status_msg = await message.answer("⏳ Получаю данные и обучаю нейросеть...")
+    status_msg = await message.answer("⏳ Анализ 5-минутных свечей...")
 
     try:
         df_raw = await get_market_data()
         if df_raw is None:
-            await status_msg.edit_text("❌ Ошибка получения данных от CoinGecko. Попробуйте еще раз через 10 секунд.")
+            await status_msg.edit_text("❌ Ошибка получения данных.")
             return
 
         df_processed, pred_price, next_time = predict_next_5min(df_raw)
         if pred_price is None:
-            await status_msg.edit_text("❌ Не удалось построить модель (мало данных).")
+            await status_msg.edit_text("❌ Мало данных для построения модели.")
             return
 
         plot_buf = create_plot(df_processed, pred_price, next_time)
@@ -325,7 +300,7 @@ async def cmd_predict(message: types.Message):
         
         caption = (
             f"{emoji} **Прогноз BTC/USDT (5m)**\n\n"
-            f"Текущая: `{current_price:.2f}` $\n"
+            f"Текущая свеча: `{current_price:.2f}` $\n"
             f"Прогноз на {time_str}: `{pred_price:.2f}` $\n\n"
             f"Изменение: `{diff:+.2f}` $\n"
             f"Осталось прогнозов: `{user_limits[user_id]['balance'] - 1}`"
@@ -347,7 +322,7 @@ async def cmd_predict(message: types.Message):
         await status_msg.edit_text("❌ Произошла ошибка бота.")
 
 async def main():
-    # ВАЖНО: Сбрасываем вебхуки перед запуском поллинга, чтобы избежать конфликтов
+    # Сброс вебхуков для устранения конфликта
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
