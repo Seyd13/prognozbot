@@ -40,7 +40,7 @@ user_limits = defaultdict(lambda: {'balance': STARTING_BALANCE, 'last_prediction
 async def get_market_data():
     """
     Получает данные с CoinGecko API.
-    ИСПРАВЛЕНО: Используем '5min' вместо '5T' для совместимости с новыми версиями Pandas.
+    ИСПРАВЛЕНО: Используем '5min'. Добавлен запрос объемов (total_volumes).
     """
     url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=1"
     
@@ -53,18 +53,29 @@ async def get_market_data():
             async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as response:
                 if response.status == 200:
                     data = await response.json()
-                    prices = data.get('prices', []) 
-                    if not prices:
+                    prices = data.get('prices', [])
+                    volumes = data.get('total_volumes', []) 
+                    
+                    if not prices or not volumes:
                         return None
 
-                    df = pd.DataFrame(prices, columns=['timestamp', 'close'])
-                    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                    # Создаем DataFrame для цен
+                    df_prices = pd.DataFrame(prices, columns=['timestamp', 'close'])
                     
-                    # --- ИСПРАВЛЕНИЕ ВРЕМЕНИ ---
+                    # Создаем DataFrame для объемов
+                    df_volumes = pd.DataFrame(volumes, columns=['timestamp', 'volume'])
+                    
+                    # Объединяем по времени
+                    df = pd.merge(df_prices, df_volumes, on='timestamp', how='left')
+                    
+                    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
                     df.set_index('timestamp', inplace=True)
                     
-                    # ИСПОЛЬЗУЕМ '5min' ВМЕСТО '5T'
-                    df = df.resample('5min').agg({'close': 'last'})
+                    # Ресемплирование: Цена - последняя, Объем - сумма за 5 минут
+                    df = df.resample('5min').agg({
+                        'close': 'last',
+                        'volume': 'sum'
+                    })
                     
                     df.dropna(inplace=True)
                     
@@ -73,6 +84,7 @@ async def get_market_data():
                     
                     df = df.rename(columns={'timestamp': 'close_time'})
                     
+                    # Берем последние 60 свечей
                     df = df.tail(60).reset_index(drop=True)
                     return df
                 else:
@@ -93,24 +105,45 @@ def calculate_rsi(series, period=14):
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
+def calculate_atr(df, period=14):
+    """Расчет Average True Range для оценки волатильности"""
+    high = df['close'].rolling(window=1).max()
+    low = df['close'].rolling(window=1).min()
+    close_prev = df['close'].shift(1)
+    tr = pd.concat([high - low, abs(high - close_prev), abs(low - close_prev)], axis=1).max(axis=1)
+    atr = tr.rolling(window=period).mean()
+    return atr
+
 def predict_next_5min(df):
     """
-    Предсказывает СЛЕДУЮЩУЮ 5-минутную свечу.
+    Улучшенное предсказание с учетом объемов и сложной архитектурой.
     """
     df = df.copy()
+    
+    # 1. Генерация признаков (Features Engineering)
     df['rsi'] = calculate_rsi(df['close'])
     df['change'] = df['close'].diff()
+    df['vol_change'] = df['volume'].pct_change() # Изменение объема в %
+    df['atr'] = calculate_atr(df) # Волатильность
+    
+    # Нормализация объема (важно для нейросети)
+    df['volume_norm'] = df['volume'] / df['volume'].rolling(window=14).mean()
+    
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
     df.dropna(inplace=True)
 
-    if len(df) < 15:
+    if len(df) < 20:
         return None, None, None
 
-    data = df[['close', 'rsi', 'change']].values
+    # Признаки: Цена, RSI, Изм.Цены, Объем_норм, Изм.Объема
+    features = ['close', 'rsi', 'change', 'volume_norm', 'vol_change']
+    data = df[features].values
+    
     scaler = MinMaxScaler()
     scaled_data = scaler.fit_transform(data)
 
     X, y = [], []
-    look_back = 10
+    look_back = 15 # Смотрим на 15 свечей назад (75 минут истории)
     
     if len(scaled_data) <= look_back:
         return None, None, None
@@ -125,7 +158,18 @@ def predict_next_5min(df):
     X = np.array(X)
     y = np.array(y)
 
-    model = MLPRegressor(hidden_layer_sizes=(10, 5), max_iter=500, random_state=42)
+    # 2. Архитектура нейросети (Deep Learning)
+    # Увеличенное количество слоев и нейронов для поиска сложных паттернов
+    model = MLPRegressor(
+        hidden_layer_sizes=(100, 50, 20), 
+        activation='relu',
+        solver='adam',
+        max_iter=1000, 
+        random_state=42,
+        early_stopping=True,
+        validation_fraction=0.1
+    )
+    
     try:
         model.fit(X, y)
     except Exception as e:
@@ -136,15 +180,26 @@ def predict_next_5min(df):
     predicted_scaled = model.predict(last_window)[0]
     
     # Обратное масштабирование
-    dummy_array = np.zeros((1, 3))
+    dummy_array = np.zeros((1, len(features)))
     dummy_array[0, 0] = predicted_scaled
-    dummy_array[0, 1] = scaled_data[-1, 1] 
-    dummy_array[0, 2] = scaled_data[-1, 2] 
+    
+    # Заполняем остальные признаки последними известными значениями
+    for i in range(1, len(features)):
+        dummy_array[0, i] = scaled_data[-1, i]
     
     predicted_price_full = scaler.inverse_transform(dummy_array)
     predicted_price = predicted_price_full[0, 0]
 
-    # Логика времени: прибавляем 5 минут к последней точке
+    # 3. Фильтрация аномалий (Safety Check)
+    current_price = df['close'].iloc[-1]
+    max_allowed_change = current_price * 0.02 # Макс 2% за 5 минут
+    
+    if abs(predicted_price - current_price) > max_allowed_change:
+        logging.warning(f"Предсказание {predicted_price} отклонено как аномалия. Текущая: {current_price}")
+        # Если нейросеть "сходит с ума", корректируем прогноз к среднему движению
+        avg_change = df['change'].tail(5).mean()
+        predicted_price = current_price + avg_change
+
     last_time = df['close_time'].iloc[-1]
     next_time = last_time + timedelta(minutes=5)
 
@@ -194,7 +249,7 @@ def create_plot(df, predicted_price, next_time):
 
     ax.get_xaxis().set_visible(False)
     
-    ax.set_title(f"BTC/USDT AI Prediction (5m TF) ({TIMEZONE_STR})", color='white', fontsize=16)
+    ax.set_title(f"BTC/USDT Deep Analysis (Volume+RSI) ({TIMEZONE_STR})", color='white', fontsize=16)
     ax.set_ylabel("Цена ($)", color='gray')
     ax.grid(True, color='gray', linestyle=':', alpha=0.3)
     
@@ -229,7 +284,7 @@ async def cmd_start(message: types.Message):
         user_limits[user_id] = {'balance': STARTING_BALANCE, 'last_prediction_time': None}
     await message.answer(
         "👋 Добро пожаловать в AI BTC Predictor!\n\n"
-        "Анализ рынка с таймфреймом 5 минут.\n"
+        "Deep Analysis: RSI + Volume + Neural Net.\n"
         f"Часовой пояс: {TIMEZONE_STR}.",
         reply_markup=main_keyboard
     )
@@ -238,8 +293,9 @@ async def cmd_start(message: types.Message):
 async def cmd_info(message: types.Message):
     await message.answer(
         f"📊 **Как это работает:**\n"
-        f"1. Данные выравниваются по 5-минутным свечам.\n"
-        f"2. Прогноз дается на следующую свечу.\n\n"
+        f"1. Анализ 5-минутных свечей.\n"
+        f"2. Учитываются: Цена, RSI, Объем торгов.\n"
+        f"3. Фильтрация аномалий.\n\n"
         "⚠️ *Не финансовый совет.*",
         parse_mode="Markdown"
     )
@@ -268,7 +324,7 @@ async def cmd_predict(message: types.Message):
             await message.answer(f"⏳ Подождите {remain} сек перед новым запросом.")
             return
 
-    status_msg = await message.answer("⏳ Анализ 5-минутных свечей...")
+    status_msg = await message.answer("⏳ Запуск Deep Analysis (Volume + RSI)...")
 
     try:
         df_raw = await get_market_data()
@@ -290,7 +346,7 @@ async def cmd_predict(message: types.Message):
         
         caption = (
             f"{emoji} **Прогноз BTC/USDT (5m)**\n\n"
-            f"Текущая свеча: `{current_price:.2f}` $\n"
+            f"Текущая: `{current_price:.2f}` $\n"
             f"Прогноз на {time_str}: `{pred_price:.2f}` $\n\n"
             f"Изменение: `{diff:+.2f}` $\n"
             f"Осталось прогнозов: `{user_limits[user_id]['balance'] - 1}`"
@@ -312,7 +368,7 @@ async def cmd_predict(message: types.Message):
         await status_msg.edit_text("❌ Произошла ошибка бота.")
 
 async def main():
-    # Сброс вебхуков для устранения конфликта
+    # Сброс вебхуков
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
