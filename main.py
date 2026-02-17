@@ -40,8 +40,7 @@ user_limits = defaultdict(lambda: {'balance': STARTING_BALANCE, 'last_prediction
 async def get_market_data():
     """
     Получает данные с CoinGecko API.
-    ИСПРАВЛЕНИЕ: days=1 дает данные за сутки. 
-    Мы делаем ресемплирование (resample), чтобы выровнять точки ровно по 5 минут.
+    ИСПРАВЛЕНО: Используем '5min' вместо '5T' для совместимости с новыми версиями Pandas.
     """
     url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=1"
     
@@ -61,25 +60,19 @@ async def get_market_data():
                     df = pd.DataFrame(prices, columns=['timestamp', 'close'])
                     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
                     
-                    # --- КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ ВРЕМЕНИ ---
-                    # 1. Устанавливаем timestamp как индекс
+                    # --- ИСПРАВЛЕНИЕ ВРЕМЕНИ ---
                     df.set_index('timestamp', inplace=True)
                     
-                    # 2. Ресемплируем в 5-минутные свечи ('5T').
-                    # Это создает строгие интервалы: 13:00, 13:05, 13:10 и т.д.
-                    # agg({'close': 'last'}) берет последнюю цену в 5-минутном окне.
-                    df = df.resample('5T').agg({'close': 'last'})
+                    # ИСПОЛЬЗУЕМ '5min' ВМЕСТО '5T'
+                    df = df.resample('5min').agg({'close': 'last'})
                     
-                    # 3. Удаляем пустые строки (если данных не было)
                     df.dropna(inplace=True)
                     
-                    # 4. Возвращаем timestamp в колонку и конвертируем часовой пояс
                     df.reset_index(inplace=True)
                     df['timestamp'] = df['timestamp'].dt.tz_localize('UTC').dt.tz_convert(LOCAL_TIMEZONE)
                     
                     df = df.rename(columns={'timestamp': 'close_time'})
                     
-                    # Берем последние 60 свечей (5 часов истории)
                     df = df.tail(60).reset_index(drop=True)
                     return df
                 else:
@@ -117,7 +110,7 @@ def predict_next_5min(df):
     scaled_data = scaler.fit_transform(data)
 
     X, y = [], []
-    look_back = 10 # Смотрим на 10 свечей назад (50 минут)
+    look_back = 10
     
     if len(scaled_data) <= look_back:
         return None, None, None
@@ -151,8 +144,7 @@ def predict_next_5min(df):
     predicted_price_full = scaler.inverse_transform(dummy_array)
     predicted_price = predicted_price_full[0, 0]
 
-    # --- ЛОГИКА ВРЕМЕНИ ПРОГНОЗА ---
-    # Берем время последней свечи в данных и прибавляем ровно 5 минут.
+    # Логика времени: прибавляем 5 минут к последней точке
     last_time = df['close_time'].iloc[-1]
     next_time = last_time + timedelta(minutes=5)
 
@@ -162,7 +154,6 @@ def create_plot(df, predicted_price, next_time):
     plt.style.use('dark_background')
     fig, ax = plt.subplots(figsize=(12, 8))
     
-    # Берем последние 20 свечей (100 минут)
     plot_df = df.tail(20).copy()
     
     plot_df['close_time_plot'] = plot_df['close_time'].dt.tz_localize(None)
@@ -247,8 +238,8 @@ async def cmd_start(message: types.Message):
 async def cmd_info(message: types.Message):
     await message.answer(
         f"📊 **Как это работает:**\n"
-        f"1. Данные выравниваются по 5-минутным свечам (13:00, 13:05...).\n"
-        f"2. Прогноз дается на следующую 5-минутную свечу.\n\n"
+        f"1. Данные выравниваются по 5-минутным свечам.\n"
+        f"2. Прогноз дается на следующую свечу.\n\n"
         "⚠️ *Не финансовый совет.*",
         parse_mode="Markdown"
     )
@@ -272,7 +263,6 @@ async def cmd_predict(message: types.Message):
     last_time = user_limits[user_id]['last_prediction_time']
     if last_time:
         now = datetime.now(LOCAL_TIMEZONE)
-        # Ограничение 5 минут
         if (now - last_time).total_seconds() < 300:
             remain = int(300 - (now - last_time).total_seconds())
             await message.answer(f"⏳ Подождите {remain} сек перед новым запросом.")
@@ -331,4 +321,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
-
