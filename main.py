@@ -1,8 +1,9 @@
 import asyncio
 import logging
+import os
 from datetime import datetime, timedelta
 from io import BytesIO
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple
 
 import aiohttp
 import pandas as pd
@@ -13,27 +14,30 @@ import matplotlib.pyplot as plt
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import BufferedInputFile, ReplyKeyboardMarkup, KeyboardButton
+from dotenv import load_dotenv
 from collections import defaultdict
 from zoneinfo import ZoneInfo
 
 # --- КОНФИГУРАЦИЯ ---
-TELEGRAM_TOKEN = "2122435147:AAG_52ELCHjFnXNxcAP4i5xNAal9I91xNTM" # Вставьте свой токен
+load_dotenv()
+TELEGRAM_TOKEN = "2122435147:AAG_52ELCHjFnXNxcAP4i5xNAal9I91xNTM" 
 
 # ВРЕМЯ
 TIMEZONE_STR = "Europe/Moscow"
 LOCAL_TIMEZONE = ZoneInfo(TIMEZONE_STR)
 
-# НАСТРОЙКИ СТРАТЕГИИ (LHLP Optimized)
-# Подобраны для 5-минутного таймфрейма, можно менять
-STRATEGY_PARAMS = {
-    'sma_volume_period': 50,  # Период SMA объема (в оригинале 120, для 5м лучше меньше)
-    'rsi_period': 14,         # Период RSI
-    'rsi_long_threshold': 35, # Порог RSI для лонга (перепроданность) (было 30)
-    'rsi_short_threshold': 70,# Порог RSI для шорта (перекупленность) (для улучшения шортов)
-    'rsi_take_profit': 55     # Уровень RSI для фиксации прибыли (было 60)
+# --- НАСТРОЙКИ СТРАТЕГИИ (LHLP Optimized) ---
+STRATEGY_CONFIG = {
+    'sma_volume_period': 50,   # Период SMA объема
+    'rsi_period': 14,          # Период RSI
+    'rsi_long_enter': 30,      # Порог RSI для Long (как в вашем индикаторе)
+    'rsi_short_enter': 70,     # Порог RSI для Short (улучшение)
 }
 
 STARTING_BALANCE = 100
+COOLDOWN_SECONDS = 300 # 5 минут
+
+# Монеты для анализа
 COINS = {
     'BTC': {'id': 'bitcoin', 'symbol': 'BTC/USDT'},
     'ETH': {'id': 'ethereum', 'symbol': 'ETH/USDT'},
@@ -46,14 +50,24 @@ bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
 # --- БАЗА ДАННЫХ ---
-user_limits = defaultdict(lambda: {'balance': STARTING_BALANCE, 'last_prediction_time': None})
+# Структура: {'balance': 100, 'last_time': None, 'coins': {'BTC': {...}, 'ETH': {...}, 'TON': {...}}}
+def get_default_user_data():
+    return {
+        'balance': STARTING_BALANCE, # Общий баланс пока оставим, или можно убрать
+        'last_prediction_time': None,
+        'coins': {
+            'BTC': {'balance': STARTING_BALANCE, 'last_time': None},
+            'ETH': {'balance': STARTING_BALANCE, 'last_time': None},
+            'TON': {'balance': STARTING_BALANCE, 'last_time': None}
+        }
+    }
 
-# --- ФУНКЦИИ ДАННЫХ И АНАЛИЗА ---
+user_limits = defaultdict(get_default_user_data)
+
+# --- ФУНКЦИИ ---
 
 async def get_market_data(coin_id: str):
-    """
-    Получает данные с CoinGecko API для конкретной монеты.
-    """
+    """Получает данные с CoinGecko API."""
     url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days=1"
     
     headers = {
@@ -68,8 +82,7 @@ async def get_market_data(coin_id: str):
                     prices = data.get('prices', [])
                     volumes = data.get('total_volumes', []) 
                     
-                    if not prices or not volumes:
-                        return None
+                    if not prices or not volumes: return None
 
                     df_prices = pd.DataFrame(prices, columns=['timestamp', 'close'])
                     df_volumes = pd.DataFrame(volumes, columns=['timestamp', 'volume'])
@@ -79,33 +92,23 @@ async def get_market_data(coin_id: str):
                     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
                     df.set_index('timestamp', inplace=True)
                     
-                    # Ресемплирование: Цена - последняя, Объем - сумма за 5 минут
-                    df = df.resample('5min').agg({
-                        'close': 'last',
-                        'volume': 'sum'
-                    })
-                    
+                    df = df.resample('5min').agg({'close': 'last', 'volume': 'sum'})
                     df.dropna(inplace=True)
                     
                     df.reset_index(inplace=True)
                     df['timestamp'] = df['timestamp'].dt.tz_localize('UTC').dt.tz_convert(LOCAL_TIMEZONE)
-                    
                     df = df.rename(columns={'timestamp': 'close_time'})
                     
-                    # Берем последние 100 свечей для расчета индикаторов
-                    df = df.tail(100).reset_index(drop=True)
+                    df = df.tail(80).reset_index(drop=True)
                     return df
                 else:
                     logging.error(f"Ошибка CoinGecko HTTP: {response.status}")
                     return None
-    except asyncio.TimeoutError:
-        logging.error("Таймаут соединения")
-        return None
     except Exception as e:
         logging.error(f"Ошибка подключения: {e}")
         return None
 
-def calculate_rsi(series, period):
+def calculate_rsi(series, period=14):
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
@@ -113,27 +116,19 @@ def calculate_rsi(series, period):
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
-def analyze_strategy(df: pd.DataFrame, params: dict) -> Tuple[pd.DataFrame, Optional[str], float]:
-    """
-    Анализ по стратегии LHLP Optimized.
-    Возвращает DataFrame с индикаторами, сигнал и уверенность.
-    """
+def analyze_with_strategy(df: pd.DataFrame):
+    """Анализ на основе стратегии LHLP Optimized."""
     df = df.copy()
     
-    # 1. Расчет индикаторов
-    df['sma_vol'] = df['volume'].rolling(window=params['sma_volume_period']).mean()
-    df['rsi'] = calculate_rsi(df['close'], params['rsi_period'])
+    # Индикаторы
+    df['sma_vol'] = df['volume'].rolling(window=STRATEGY_CONFIG['sma_volume_period']).mean()
+    df['rsi'] = calculate_rsi(df['close'], STRATEGY_CONFIG['rsi_period'])
     
-    # Удаляем NaN, возникшие из-за скользящих окон
     df.dropna(inplace=True)
     
-    if len(df) < 5:
-        return df, None, 0.0
+    if len(df) < 5: return df, "NO_DATA", 0, 0
 
-    # Последние значения
     last = df.iloc[-1]
-    prev = df.iloc[-2]
-    
     current_price = last['close']
     current_rsi = last['rsi']
     current_vol = last['volume']
@@ -141,131 +136,104 @@ def analyze_strategy(df: pd.DataFrame, params: dict) -> Tuple[pd.DataFrame, Opti
     
     signal = "NEUTRAL"
     confidence = 0.0
+    target_price = current_price
     
-    # --- ЛОГИКА LONG (Ваша стратегия) ---
-    # Условие: Объем больше SMA И RSI ниже порога (перепроданность)
-    is_volume_spike = current_vol > avg_vol
-    is_oversold = current_rsi < params['rsi_long_threshold']
+    # Логика
+    volume_spike = current_vol > avg_vol
     
-    # Проверяем, был ли сигнал на предыдущей свече (для уверенности) или сейчас
-    long_condition = is_volume_spike and is_oversold
-    
-    # --- ЛОГИКА SHORT (Улучшенная) ---
-    # Условие: Объем больше SMA И RSI выше порога (перекупленность)
-    is_overbought = current_rsi > params['rsi_short_threshold']
-    short_condition = is_volume_spike and is_overbought
-
-    # --- Определение сигнала ---
-    if long_condition:
+    # LONG: Vol > SMA & RSI < 30
+    if volume_spike and (current_rsi < STRATEGY_CONFIG['rsi_long_enter']):
         signal = "LONG"
-        # Уверенность: насколько сильно превышен объем и насколько низко RSI
         vol_ratio = current_vol / avg_vol if avg_vol > 0 else 1
-        rsi_dist = abs(params['rsi_long_threshold'] - current_rsi) # Чем ниже RSI, тем лучше
-        confidence = min((vol_ratio - 1) * 50 + rsi_dist, 100) # Нормализация
-        
-    elif short_condition:
+        confidence = min(30 + (vol_ratio * 10) + (STRATEGY_CONFIG['rsi_long_enter'] - current_rsi), 95)
+        # Цель - движение против тренда (отскок), берем среднюю волатильность * уверенность
+        volatility = df['close'].pct_change().tail(5).std()
+        target_price = current_price * (1 + volatility * (confidence/50))
+
+    # SHORT: Vol > SMA & RSI > 70
+    elif volume_spike and (current_rsi > STRATEGY_CONFIG['rsi_short_enter']):
         signal = "SHORT"
         vol_ratio = current_vol / avg_vol if avg_vol > 0 else 1
-        rsi_dist = abs(current_rsi - params['rsi_short_threshold']) # Чем выше RSI, тем лучше
-        confidence = min((vol_ratio - 1) * 50 + rsi_dist, 100)
+        confidence = min(30 + (vol_ratio * 10) + (current_rsi - STRATEGY_CONFIG['rsi_short_enter']), 95)
+        volatility = df['close'].pct_change().tail(5).std()
+        target_price = current_price * (1 - volatility * (confidence/50))
         
     else:
-        # Если явного сигнала нет, смотрим тренд RSI для нейтрального прогноза цены
-        signal = "NEUTRAL"
-        # Простая экстраполяция для цены, если нет сигнала
-        confidence = 0
+        # Нейтрально - инерция
+        last_change = df['close'].iloc[-1] - df['close'].iloc[-2]
+        target_price = current_price + last_change
 
-    return df, signal, confidence
+    return df, signal, target_price, confidence
 
-def predict_price_action(df: pd.DataFrame, signal: str, confidence: float, params: dict) -> Tuple[float, str]:
-    """
-    Генерирует прогноз цены на основе сигнала.
-    Возвращает целевую цену и текстовое описание.
-    """
-    current_price = df['close'].iloc[-1]
-    volatility = df['close'].pct_change().std() # Волатильность для расчета цели
-    
-    target_price = current_price
-    action_text = "Флэт / Ожидание"
-    
-    # Коэффициент движения зависит от уверенности (0.5% - 2% движения)
-    move_factor = 0.005 + (confidence / 100) * 0.015 
-    
-    if signal == "LONG":
-        target_price = current_price * (1 + move_factor)
-        action_text = f"🚀 **LONG Signal** (Уверенность: {confidence:.1f}%)"
-    elif signal == "SHORT":
-        target_price = current_price * (1 - move_factor)
-        action_text = f"🔻 **SHORT Signal** (Уверенность: {confidence:.1f}%)"
-    else:
-        # Если нейтрально, предсказываем небольшое движение по тренду RSI
-        rsi = df['rsi'].iloc[-1]
-        if rsi > 50:
-            target_price = current_price * (1 + volatility * 0.5) # Небольшой рост
-            action_text = "↗️ Слабый тренд вверх (Нет явного сигнала)"
-        else:
-            target_price = current_price * (1 - volatility * 0.5) # Небольшое падение
-            action_text = "↙️ Слабый тренд вниз (Нет явного сигнала)"
-
-    return target_price, action_text
-
-def create_plot(df: pd.DataFrame, target_price: float, signal: str, coin_symbol: str, params: dict):
+def create_plot(df, target_price, signal, coin_symbol):
+    """Отрисовка графика в оригинальном стиле с подписями на точках."""
     plt.style.use('dark_background')
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), gridspec_kw={'height_ratios': [3, 1]})
+    fig, ax = plt.subplots(figsize=(12, 8))
     
     plot_df = df.tail(20).copy()
     plot_df['close_time_plot'] = plot_df['close_time'].dt.tz_localize(None)
     
-    # График цены
-    ax1.plot(plot_df['close_time_plot'], plot_df['close'], 
-            color='white', marker='o', linestyle='-', markersize=6, zorder=2, label='Цена')
-    
-    # Определяем цвет прогноза
-    pred_color = 'gray'
-    if signal == "LONG": pred_color = 'lime'
-    elif signal == "SHORT": pred_color = 'red'
-    
-    # Точка текущая и Прогноз
     last_time = plot_df['close_time_plot'].iloc[-1]
     next_time = last_time + timedelta(minutes=5)
     current_price = plot_df['close'].iloc[-1]
     
+    # Цвета
+    if signal == "LONG": pred_color = 'lime'
+    elif signal == "SHORT": pred_color = 'red'
+    else: pred_color = 'gray'
+    
+    # Линия истории
+    ax.plot(plot_df['close_time_plot'], plot_df['close'], 
+            color='cyan', marker='o', linestyle='-', markersize=8, zorder=2)
+    
     # Линия прогноза
-    ax1.plot([last_time, next_time], [current_price, target_price],
-            color=pred_color, linestyle='--', marker='x', markersize=10, zorder=3, linewidth=2)
+    ax.plot([last_time, next_time], [current_price, target_price],
+            color=pred_color, linestyle='--', marker='x', markersize=10, zorder=3)
     
-    ax1.scatter(next_time, target_price, color=pred_color, s=150, zorder=4, edgecolors='white', linewidth=1.5)
+    # Точка прогноза
+    ax.scatter(next_time, target_price, color=pred_color, s=200, zorder=4, edgecolors='white')
 
-    # Подписи
-    ax1.set_title(f"{coin_symbol} Strategy Analysis", color='white', fontsize=16, fontweight='bold')
-    ax1.grid(True, color='gray', linestyle=':', alpha=0.3)
-    ax1.legend(loc='upper left')
+    # --- ОТРИСОВКА ТЕКСТА (ВОЗВРАЩЕНО) ---
     
-    # Подграфик Volume
-    colors = ['green' if plot_df['close'].iloc[i] >= plot_df['close'].iloc[i-1] else 'red' 
-              for i in range(1, len(plot_df))]
-    colors.insert(0, 'gray') # Первая свеча
+    # Исторические точки
+    for x, y, time_obj in zip(plot_df['close_time_plot'], plot_df['close'], plot_df['close_time']):
+        time_str = time_obj.strftime('%H:%M')
+        price_str = f"{y:.0f}" if y > 10 else f"{y:.2f}"
+        
+        ax.annotate(time_str, (x, y), textcoords="offset points", xytext=(0,12), 
+                    ha='center', fontsize=9, color='yellow', fontweight='bold')
+        ax.annotate(price_str, (x, y), textcoords="offset points", xytext=(0,-12), 
+                    ha='center', fontsize=8, color='white')
+
+    # Точка прогноза
+    pred_time_str = next_time.strftime('%H:%M')
+    # Форматирование цены прогноза
+    if target_price > 10:
+        pred_price_str = f"{target_price:.0f}"
+    else:
+        pred_price_str = f"{target_price:.2f}"
     
-    ax2.bar(plot_df['close_time_plot'], plot_df['volume'], color=colors, alpha=0.6)
-    ax2.plot(plot_df['close_time_plot'], plot_df['sma_vol'], color='yellow', linestyle='-', linewidth=1.5, label='SMA Vol')
-    ax2.set_ylabel("Volume", color='gray')
-    ax2.grid(True, color='gray', linestyle=':', alpha=0.3)
-    ax2.legend(loc='upper left')
+    ax.annotate(pred_time_str, (next_time, target_price), textcoords="offset points", xytext=(0,15), 
+                ha='center', fontsize=10, color=pred_color, fontweight='bold')
+    ax.annotate(pred_price_str, (next_time, target_price), textcoords="offset points", xytext=(0,-15), 
+                ha='center', fontsize=9, color=pred_color, fontweight='bold')
+
+    ax.get_xaxis().set_visible(False)
     
-    # Убираем даты с оси X
-    ax1.get_xaxis().set_visible(False)
-    ax2.tick_params(axis='x', rotation=45)
+    ax.set_title(f"{coin_symbol} Strategy Analysis", color='white', fontsize=16)
+    ax.set_ylabel("Цена ($)", color='gray')
+    ax.grid(True, color='gray', linestyle=':', alpha=0.3)
+    
+    ax.legend(['История', f'Прогноз ({signal})'], loc='upper left')
 
     buf = BytesIO()
-    plt.tight_layout()
-    plt.savefig(buf, format='png', dpi=100)
+    plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
     plt.close(fig)
     buf.seek(0)
     return BufferedInputFile(buf.getvalue(), f"{coin_symbol.lower()}_prediction.png")
 
 # --- ХЕНДЛЕРЫ ---
 
-# Клавиатуры
 main_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📊 Анализ BTC"), KeyboardButton(text="📊 Анализ ETH")],
@@ -279,19 +247,22 @@ main_keyboard = ReplyKeyboardMarkup(
 
 @dp.startup()
 async def on_startup():
+    # ВАЖНО: Сброс вебхуков для предотвращения конфликта
+    await bot.delete_webhook(drop_pending_updates=True)
     logging.info("Бот запущен.")
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
+    # Инициализация данных при старте
     if user_id not in user_limits:
-        user_limits[user_id] = {'balance': STARTING_BALANCE, 'last_prediction_time': None}
+        user_limits[user_id] = get_default_user_data()
+        
     await message.answer(
         "👋 Добро пожаловать в AI Strategy Bot!\n\n"
-        "Используется стратегия: **LHLP Optimized** (Volume + RSI).\n"
-        "Добавлены монеты: BTC, ETH, TON.\n"
-        "Улучшен анализ шортов.\n"
-        f"Часовой пояс: {TIMEZONE_STR}.",
+        "🧠 **Обновлено:** Стратегия *LHLP Optimized* (RSI + Volume).\n"
+        "📊 Раздельный баланс и задержки для BTC, ETH, TON.\n"
+        f"🕐 Часовой пояс: {TIMEZONE_STR}.",
         reply_markup=main_keyboard,
         parse_mode="Markdown"
     )
@@ -300,105 +271,120 @@ async def cmd_start(message: types.Message):
 async def cmd_info(message: types.Message):
     await message.answer(
         f"📊 **Логика стратегии:**\n"
-        f"1. **LONG:** Объем > SMA Vol и RSI < {STRATEGY_PARAMS['rsi_long_threshold']}.\n"
-        f"2. **SHORT:** Объем > SMA Vol и RSI > {STRATEGY_PARAMS['rsi_short_threshold']}.\n"
-        f"3. **Фильтр:** Анализ 5-минутных свечей.\n\n"
+        f"1. **LONG:** Объем > SMA Vol и RSI < {STRATEGY_CONFIG['rsi_long_enter']}.\n"
+        f"2. **SHORT:** Объем > SMA Vol и RSI > {STRATEGY_CONFIG['rsi_short_enter']}.\n"
+        f"3. **Баланс:** Отдельный для каждой монеты.\n\n"
         "⚠️ *Не финансовый совет.*",
         parse_mode="Markdown"
     )
 
 @dp.message(F.text == "💳 Мой баланс")
 async def cmd_balance(message: types.Message):
-    user_data = user_limits.get(message.from_user.id, {'balance': 0})
-    await message.answer(
-        f"💳 **Ваш баланс:** `{user_data['balance']}` прогнозов.",
-        parse_mode="Markdown"
+    user_data = user_limits.get(message.from_user.id, get_default_user_data())
+    balances = user_data['coins']
+    
+    text = (
+        f"💳 **Баланс прогнозов:**\n\n"
+        f" BTC: `{balances['BTC']['balance']}`\n"
+        f" ETH: `{balances['ETH']['balance']}`\n"
+        f" TON: `{balances['TON']['balance']}`"
     )
+    await message.answer(text, parse_mode="Markdown")
 
 @dp.message(F.text == "💹 Цена сейчас")
 async def cmd_current_price(message: types.Message):
     status_msg = await message.answer("⏳ Получение актуальных цен...")
     
-    prices_text = "💹 **Актуальные цены:**\n\n"
+    prices_text = "💹 **Актуальные цены сейчас:**\n\n"
     
     try:
         async with aiohttp.ClientSession() as session:
-            # Запрашиваем цены для всех монет одним запросом для скорости
             ids = ','.join([c['id'] for c in COINS.values()])
             url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd"
             
             async with session.get(url) as response:
                 if response.status == 200:
                     data = await response.json()
+                    if not data:
+                        await status_msg.edit_text("❌ Ошибка данных (пусто).")
+                        return
+                        
                     for name, info in COINS.items():
-                        price = data.get(info['id'], {}).get('usd', 'N/A')
-                        if isinstance(price, float):
-                            prices_text += f"• **{name}:** `${price:.2f}`\n"
+                        # Безопасное получение цены
+                        price = data.get(info['id'], {}).get('usd', None)
+                        if price:
+                            p_str = f"{price:.2f}" if price < 100 else f"{price:.0f}"
+                            prices_text += f"• **{name}:** `${p_str}`\n"
                         else:
-                            prices_text += f"• **{name}:** `Error`\n"
+                            prices_text += f"• **{name}:** `Ошибка`\n"
                 else:
-                    prices_text = "❌ Ошибка получения данных."
+                    prices_text = "❌ Ошибка API."
 
         await status_msg.edit_text(prices_text, parse_mode="Markdown")
 
     except Exception as e:
         logging.error(f"Ошибка цен: {e}")
-        await status_msg.edit_text("❌ Ошибка при получении цен.")
+        await status_msg.edit_text("❌ Не удалось получить цены.")
 
-# Универсальный обработчик анализа
+# Универсальная функция анализа
 async def process_analysis(message: types.Message, coin_name: str):
     user_id = message.from_user.id
+    user_data = user_limits[user_id]
+    coin_data = user_data['coins'][coin_name]
     
-    if user_limits[user_id]['balance'] <= 0:
-        await message.answer("❌ У вас закончились прогнозы. Баланс: 0.")
+    # Проверка баланса конкретной монеты
+    if coin_data['balance'] <= 0:
+        await message.answer(f"❌ У вас закончились прогнозы для {coin_name}.")
         return
 
-    last_time = user_limits[user_id]['last_prediction_time']
+    # Проверка задержки конкретной монеты
+    last_time = coin_data['last_time']
+    now = datetime.now(LOCAL_TIMEZONE)
+    
     if last_time:
-        now = datetime.now(LOCAL_TIMEZONE)
-        if (now - last_time).total_seconds() < 300:
-            remain = int(300 - (now - last_time).total_seconds())
-            await message.answer(f"⏳ Подождите {remain} сек перед новым запросом.")
+        diff = (now - last_time).total_seconds()
+        if diff < COOLDOWN_SECONDS:
+            remain = int(COOLDOWN_SECONDS - diff)
+            await message.answer(f"⏳ Подождите {remain} сек перед новым запросом {coin_name}.")
             return
 
-    status_msg = await message.answer(f"⏳ Анализ {coin_name} (Volume + RSI Strategy)...")
+    status_msg = await message.answer(f"⏳ Анализ {coin_name} (Strategy Mode)...")
 
     try:
-        coin_data = COINS[coin_name]
-        df_raw = await get_market_data(coin_data['id'])
+        coin_info = COINS[coin_name]
+        df_raw = await get_market_data(coin_info['id'])
         
-        if df_raw is None or len(df_raw) < 60:
-            await status_msg.edit_text("❌ Ошибка получения данных или мало истории.")
+        if df_raw is None:
+            await status_msg.edit_text("❌ Ошибка получения данных.")
             return
 
-        # Шаг 1: Анализ стратегии
-        df_processed, signal, confidence = analyze_strategy(df_raw, STRATEGY_PARAMS)
+        df_processed, signal, pred_price, confidence = analyze_with_strategy(df_raw)
         
-        # Шаг 2: Расчет целевой цены
-        target_price, action_text = predict_price_action(df_processed, signal, confidence, STRATEGY_PARAMS)
-        
-        # Шаг 3: Генерация графика
-        plot_buf = create_plot(df_processed, target_price, signal, coin_data['symbol'], STRATEGY_PARAMS)
-        
+        if signal == "NO_DATA":
+            await status_msg.edit_text("❌ Мало данных для построения модели.")
+            return
+
+        plot_buf = create_plot(df_processed, pred_price, signal, coin_info['symbol'])
         current_price = df_processed['close'].iloc[-1]
+        
+        diff = pred_price - current_price
+        emoji = "🤚" if signal == "NEUTRAL" else ("🚀" if signal == "LONG" else "🔻")
+        
         next_time = df_processed['close_time'].iloc[-1] + timedelta(minutes=5)
         time_str = next_time.strftime('%H:%M')
         
-        # Формирование сообщения
-        diff = target_price - current_price
-        diff_percent = (diff / current_price) * 100
-        
         caption = (
-            f"🎯 **Прогноз {coin_data['symbol']} (5m)**\n\n"
-            f"{action_text}\n\n"
+            f"{emoji} **Прогноз {coin_info['symbol']} (5m)**\n\n"
+            f"Сигнал: **{signal}** (Уверенность: {confidence:.0f}%)\n\n"
             f"Текущая: `${current_price:.2f}`\n"
-            f"Цель на {time_str}: `${target_price:.2f}`\n"
-            f"Изменение: `{diff_percent:+.2f}%`\n\n"
-            f"💰 Баланс: `{user_limits[user_id]['balance'] - 1}`"
+            f"Цель на {time_str}: `${pred_price:.2f}`\n"
+            f"Изменение: `{diff:+.2f}` $\n\n"
+            f"Осталось {coin_name} прогнозов: `{coin_data['balance'] - 1}`"
         )
 
-        user_limits[user_id]['balance'] -= 1
-        user_limits[user_id]['last_prediction_time'] = datetime.now(LOCAL_TIMEZONE)
+        # Списываем баланс и ставим таймер только для конкретной монеты
+        user_limits[user_id]['coins'][coin_name]['balance'] -= 1
+        user_limits[user_id]['coins'][coin_name]['last_time'] = datetime.now(LOCAL_TIMEZONE)
 
         await status_msg.delete()
         await bot.send_photo(
@@ -410,11 +396,8 @@ async def process_analysis(message: types.Message, coin_name: str):
 
     except Exception as e:
         logging.error(f"Критическая ошибка: {e}")
-        import traceback
-        traceback.print_exc()
         await status_msg.edit_text("❌ Произошла ошибка бота.")
 
-# Привязка кнопок к функции анализа
 @dp.message(F.text == "📊 Анализ BTC")
 async def cmd_btc(message: types.Message):
     await process_analysis(message, "BTC")
@@ -428,6 +411,7 @@ async def cmd_ton(message: types.Message):
     await process_analysis(message, "TON")
 
 async def main():
+    # Дополнительная очистка при запуске процесса
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
