@@ -3,7 +3,7 @@ import logging
 import os
 from datetime import datetime, timedelta
 from io import BytesIO
-from typing import Union
+from typing import Union, Optional
 
 import aiohttp
 import pandas as pd
@@ -37,6 +37,10 @@ STRATEGY_CONFIG = {
 STARTING_BALANCE = 100
 CANDLE_INTERVAL = 5 # Минуты
 
+# Кэш для защиты от спама запросов
+CACHE_DURATION = 15 # секунд
+request_cache = {}
+
 # Монеты
 COINS = {
     'BTC': {'id': 'bitcoin', 'symbol': 'BTC/USDT'},
@@ -64,6 +68,14 @@ user_limits = defaultdict(get_default_user_data)
 # --- ФУНКЦИИ ДАННЫХ ---
 
 async def get_market_data(coin_id: str) -> Union[pd.DataFrame, str, None]:
+    # Проверка кэша (защита от спама)
+    now = datetime.now()
+    if coin_id in request_cache:
+        cached_time, cached_data = request_cache[coin_id]
+        if (now - cached_time).total_seconds() < CACHE_DURATION:
+            logging.info(f"Возврат кэшированных данных для {coin_id}")
+            return cached_data
+
     url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days=1"
     headers = {"User-Agent": "Mozilla/5.0"}
 
@@ -91,9 +103,13 @@ async def get_market_data(coin_id: str) -> Union[pd.DataFrame, str, None]:
                     df['timestamp'] = df['timestamp'].dt.tz_localize('UTC').dt.tz_convert(LOCAL_TIMEZONE)
                     df = df.rename(columns={'timestamp': 'close_time'})
                     
-                    return df.tail(80).reset_index(drop=True)
+                    result = df.tail(80).reset_index(drop=True)
+                    # Сохраняем в кэш
+                    request_cache[coin_id] = (now, result)
+                    return result
                 
                 elif response.status == 429:
+                    logging.warning(f"Rate limit hit for {coin_id}")
                     return "RATE_LIMIT"
                 else:
                     logging.error(f"Ошибка HTTP: {response.status}")
@@ -167,12 +183,22 @@ def analyze_with_strategy(df: pd.DataFrame):
     return df, signal, target_price, confidence
 
 def format_price(price: float):
+    """Умное форматирование: 4 знака для мелких, 2 для средних, 0 для крупных."""
     if price > 1000:
         return f"{price:,.0f}"
     elif price > 10:
         return f"{price:,.2f}"
     else:
+        # Для TON и копеечных монет - 4 знака
         return f"{price:,.4f}"
+
+def format_diff(diff: float):
+    """Форматирование разницы цены."""
+    if abs(diff) > 10:
+        return f"{diff:+,.2f}"
+    else:
+        # Для мелких разниц показываем больше точности
+        return f"{diff:+,.4f}"
 
 def create_plot(df, target_price, signal, coin_symbol):
     plt.style.use('dark_background')
@@ -188,7 +214,6 @@ def create_plot(df, target_price, signal, coin_symbol):
     ax.plot(plot_df['close_time_plot'], plot_df['close'], 
             color='cyan', marker='o', linestyle='-', markersize=8, zorder=2)
     
-    # Точка прогноза только для LONG/SHORT
     if signal in ["LONG", "SHORT"]:
         if signal == "LONG": pred_color = 'lime'
         elif signal == "SHORT": pred_color = 'red'
@@ -316,7 +341,6 @@ async def process_analysis(message: types.Message, coin_name: str):
     user_data = user_limits[user_id]
     coin_data = user_data['coins'][coin_name]
     
-    # Проверка баланса
     if coin_data['balance'] <= 0:
         await message.answer(f"❌ У вас закончились попытки для {coin_name}. Баланс: 0.")
         return
@@ -328,7 +352,7 @@ async def process_analysis(message: types.Message, coin_name: str):
         result = await get_market_data(coin_info['id'])
         
         if isinstance(result, str) and result == "RATE_LIMIT":
-            await status_msg.edit_text("⚠️ Сервер перегружен (429). Попробуйте через минуту.")
+            await status_msg.edit_text("⚠️ Сервер перегружен (429).\nПодождите 1-2 минуты перед следующим запросом.")
             return
         
         if result is None:
@@ -337,16 +361,14 @@ async def process_analysis(message: types.Message, coin_name: str):
         
         df_raw = result
         
-        # --- ПРОВЕРКА ВРЕМЕНИ СВЕЧИ (НОВАЯ ЛОГИКА) ---
+        # --- ПРОВЕРКА ВРЕМЕНИ СВЕЧИ ---
         last_candle_time = df_raw['close_time'].iloc[-1]
         user_last_time = coin_data['last_candle_time']
         
-        # Если пользователь уже делал прогноз на ЭТУ ЖЕ свечу
         if user_last_time is not None and user_last_time >= last_candle_time:
             next_candle_time = last_candle_time + timedelta(minutes=CANDLE_INTERVAL)
             now = datetime.now(LOCAL_TIMEZONE)
             
-            # Сколько секунд осталось до следующей свечи
             remain_sec = (next_candle_time - now).total_seconds()
             
             if remain_sec > 0:
@@ -357,15 +379,12 @@ async def process_analysis(message: types.Message, coin_name: str):
                     f"Осталось попыток: {coin_data['balance']}"
                 )
             else:
-                # Если время вышло, но данные еще не обновились в API
                 await status_msg.edit_text(
-                    f"⏳ Ждем обновления данных (свеча закрыта)...\n"
+                    f"⏳ Ждем обновления данных...\n"
                     f"Попробуйте через 10-15 секунд."
                 )
             return
             
-        # Если мы здесь -> это новая свеча, делаем прогноз
-        
         df_processed, signal, pred_price, confidence = analyze_with_strategy(df_raw)
         
         if signal == "NO_DATA":
@@ -374,7 +393,6 @@ async def process_analysis(message: types.Message, coin_name: str):
 
         current_price = df_processed['close'].iloc[-1]
         
-        # Списываем попытку и обновляем время свечи
         user_limits[user_id]['coins'][coin_name]['balance'] -= 1
         user_limits[user_id]['coins'][coin_name]['last_candle_time'] = last_candle_time
         
@@ -385,7 +403,7 @@ async def process_analysis(message: types.Message, coin_name: str):
             
             caption = (
                 f"💤 **{coin_info['symbol']}**\n\n"
-                f"Сигнал: **Нет сигнала (NEUTRAL)**\n\n"
+                f"Сигнал: **Нет сигнала**\n\n"
                 f"Текущая: `${format_price(current_price)}`\n"
                 f"Условия для входа не выполнены.\n\n"
                 f"Осталось попыток: `{coin_data['balance'] - 1}`"
@@ -407,7 +425,7 @@ async def process_analysis(message: types.Message, coin_name: str):
                 f"Сигнал: **{status_text}**\n\n"
                 f"Текущая: `${format_price(current_price)}`\n"
                 f"Цель: `${format_price(pred_price)}`\n"
-                f"Изменение: `{diff:+.2f}` $\n\n"
+                f"Изменение: `{format_diff(diff)}` $\n\n"
                 f"Осталось попыток: `{coin_data['balance'] - 1}`"
             )
 
