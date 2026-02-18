@@ -167,7 +167,7 @@ def analyze_with_strategy(df: pd.DataFrame):
              target_price = current_price + trend * 0.5 # Продолжаем инерцию
         # Если тренд вниз
         elif trend < 0:
-             signal = "FLAT_DOWN # Слабое снижение
+             signal = "FLAT_DOWN" # Слабое снижение (ИСПРАВЛЕНО: ЗАКРЫТЫ КАВЫЧКИ)
              target_price = current_price + trend * 0.5
         else:
              signal = "FLAT"
@@ -185,7 +185,6 @@ def create_plot(df, target_price, signal, coin_symbol):
     bg_color = '#0a0a12'
     grid_color = '#2a2a3a'
     line_hist_color = '#00f2ff' # Яркий голубой (Cyan)
-    line_pred_color = '#ff0055' # Малиновый (Pink/Red) для контраста или Лайм
     text_color = 'white'
     
     fig.patch.set_facecolor(bg_color)
