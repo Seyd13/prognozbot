@@ -26,11 +26,10 @@ TELEGRAM_TOKEN = "2122435147:AAG_52ELCHjFnXNxcAP4i5xNAal9I91xNTM"
 TIMEZONE_STR = "Europe/Moscow"
 LOCAL_TIMEZONE = ZoneInfo(TIMEZONE_STR)
 
-# --- НАСТРОЙКИ СТРАТЕГИИ (СДЕЛАНО ЧУВСТВИТЕЛЬНЕЕ) ---
+# --- НАСТРОЙКИ СТРАТЕГИИ ---
 STRATEGY_CONFIG = {
     'sma_volume_period': 50,
     'rsi_period': 14,
-    # Было 30/70, стало 40/60 - ловим чаще
     'rsi_long_enter': 40,  
     'rsi_short_enter': 60, 
 }
@@ -135,7 +134,6 @@ def analyze_with_strategy(df: pd.DataFrame):
     
     volume_spike = current_vol > avg_vol
     
-    # Логика LONG: если объем выше среднего И RSI меньше границы (40)
     if volume_spike and (current_rsi < STRATEGY_CONFIG['rsi_long_enter']):
         signal = "LONG"
         vol_ratio = current_vol / avg_vol if avg_vol > 0 else 1
@@ -143,7 +141,6 @@ def analyze_with_strategy(df: pd.DataFrame):
         volatility = df['close'].pct_change().tail(5).std()
         target_price = current_price * (1 + volatility * (confidence/50))
 
-    # Логика SHORT: если объем выше среднего И RSI выше границы (60)
     elif volume_spike and (current_rsi > STRATEGY_CONFIG['rsi_short_enter']):
         signal = "SHORT"
         vol_ratio = current_vol / avg_vol if avg_vol > 0 else 1
@@ -174,18 +171,20 @@ def create_plot(df, target_price, signal, coin_symbol):
     plot_df = df.tail(20).copy()
     plot_df['close_time_plot'] = plot_df['close_time'].dt.tz_localize(None)
     
+    # ИСПРАВЛЕНИЕ: Берем время последней свечи и добавляем 5 минут
     last_time = plot_df['close_time_plot'].iloc[-1]
-    next_time = last_time + timedelta(minutes=5)
+    next_time = last_time + timedelta(minutes=5) 
+    
     current_price = plot_df['close'].iloc[-1]
     
     ax.plot(plot_df['close_time_plot'], plot_df['close'], 
             color='cyan', marker='o', linestyle='-', markersize=8, zorder=2)
     
-    # График рисуем только если есть сигнал (но функция вызывается только тогда)
     if signal in ["LONG", "SHORT"]:
         if signal == "LONG": pred_color = 'lime'
         elif signal == "SHORT": pred_color = 'red'
         
+        # Рисуем линию ПРОГНОЗА: от текущей цены к цели в будущем времени (next_time)
         ax.plot([last_time, next_time], [current_price, target_price],
                 color=pred_color, linestyle='--', marker='x', markersize=10, zorder=3)
         ax.scatter(next_time, target_price, color=pred_color, s=200, zorder=4, edgecolors='white')
@@ -237,22 +236,19 @@ async def broadcast_signal(coin_name: str):
     
     df_processed, signal, pred_price, confidence = analyze_with_strategy(result)
     
-    # ГЛАВНОЕ ИЗМЕНЕНИЕ: Если сигнала нет (WAIT) - просто выходим, ничего не шлем
     if signal not in ["LONG", "SHORT"]:
         logging.info(f"{coin_name}: Сигнала нет (WAIT). Пропуск рассылки.")
         return
 
     current_price = df_processed['close'].iloc[-1]
     
-    # Генерируем график
     plot_buf = create_plot(df_processed, pred_price, signal, coin_info['symbol'])
     
-    # Формируем сообщение (логика WAIT удалена, так как мы уже отсеяли выше)
     diff = pred_price - current_price
     if signal == "LONG":
         emoji = "🚀"
         status_text = f"LONG (Уверенность: {confidence:.0f}%)"
-    else: # SHORT
+    else: 
         emoji = "🔻"
         status_text = f"SHORT (Уверенность: {confidence:.0f}%)"
     
@@ -264,14 +260,12 @@ async def broadcast_signal(coin_name: str):
         f"Изменение: `{format_diff(diff)}` $"
     )
 
-    # Рассылаем всем
     tasks = []
     for user_id in subscribers:
         tasks.append(bot.send_photo(chat_id=user_id, photo=plot_buf, caption=caption, parse_mode="Markdown"))
     
     results = await asyncio.gather(*tasks, return_exceptions=True)
     
-    # Чистим список от заблокировавших бот
     for user_id, res in zip(list(subscribers), results):
         if isinstance(res, Exception):
             logging.warning(f"Ошибка отправки юзеру {user_id}. Удаляю.")
@@ -281,7 +275,6 @@ async def scheduler_loop():
     while True:
         now = datetime.now(LOCAL_TIMEZONE)
         
-        # Расчет времени до следующей свечи
         seconds_to_next = CANDLE_INTERVAL * 60 - (now.minute % CANDLE_INTERVAL) * 60 - now.second
         
         if seconds_to_next > 5:
@@ -292,9 +285,8 @@ async def scheduler_loop():
         
         for coin_name in COINS.keys():
             await broadcast_signal(coin_name)
-            await asyncio.sleep(5) # Пауза между монетами
+            await asyncio.sleep(5) 
         
-        # Пауза чтобы не зацепить текущую минуту повторно
         await asyncio.sleep(15)
 
 # --- ХЕНДЛЕРЫ ---
