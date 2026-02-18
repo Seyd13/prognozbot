@@ -30,8 +30,8 @@ LOCAL_TIMEZONE = ZoneInfo(TIMEZONE_STR)
 STRATEGY_CONFIG = {
     'sma_volume_period': 50,
     'rsi_period': 14,
-    'rsi_long_enter': 30,
-    'rsi_short_enter': 70,
+    'rsi_long_enter': 40,  # ИЗМЕНЕНО: Было 30 (чаще ловим рост)
+    'rsi_short_enter': 60, # ИЗМЕНЕНО: Было 70 (чаще ловим падение)
 }
 
 CANDLE_INTERVAL = 5 # Минуты
@@ -47,7 +47,6 @@ COINS = {
 }
 
 # Хранилище последних прогнозов: { coin_name: {'target_time': datetime, 'target_price': float} }
-# Мы запоминаем, НА КАКОЕ время мы дали прогноз и какую цену указали.
 LAST_PREDICTIONS: Dict[str, Dict] = {}
 
 logging.basicConfig(level=logging.INFO)
@@ -226,9 +225,7 @@ def create_plot(df, target_price, signal, coin_symbol):
 
 async def check_prediction_accuracy(coin_name: str, df: pd.DataFrame) -> str:
     """
-    Проверяет точность последнего прогноза.
-    Ищет в df свечу, которая соответствует времени target_time из LAST_PREDICTIONS,
-    сравнивает цену закрытия с target_price.
+    Проверяет точность последнего прогноза, если время его исполнения пришло.
     """
     if coin_name not in LAST_PREDICTIONS:
         return ""
@@ -237,9 +234,7 @@ async def check_prediction_accuracy(coin_name: str, df: pd.DataFrame) -> str:
     pred_time = pred_data['target_time']
     pred_price = pred_data['target_price']
     
-    # Нам нужно найти свечу, которая закрылась в pred_time.
-    # df содержит свечи с временами закрытия.
-    # Ищем строку, где close_time равен pred_time (с учетом точности минут)
+    # Ищем свечу, которая закрылась в pred_time
     target_row = df[df['close_time'] == pred_time]
     
     if not target_row.empty:
@@ -247,8 +242,6 @@ async def check_prediction_accuracy(coin_name: str, df: pd.DataFrame) -> str:
         
         if actual_price > 0:
             error_pct = ((actual_price - pred_price) / actual_price) * 100
-            # Формируем строку отчета
-            # Например: "Точность прогноза на 12:05: Отклонение 0.5%"
             sign = "+" if error_pct > 0 else ""
             accuracy_text = (
                 f"📊 Результат прогноза на {pred_time.strftime('%H:%M')}:\n"
@@ -256,8 +249,7 @@ async def check_prediction_accuracy(coin_name: str, df: pd.DataFrame) -> str:
                 f"Разница: `{sign}{error_pct:.2f}%`\n\n"
             )
             
-            # После того как мы проверили прогноз и вывели результат, удаляем его из истории,
-            # чтобы не проверять его снова на следующих итерациях.
+            # Удаляем использованный прогноз
             del LAST_PREDICTIONS[coin_name]
             return accuracy_text
             
@@ -281,50 +273,21 @@ async def broadcast_signal(coin_name: str):
     if signal == "NO_DATA":
         return
 
-    current_price = df_processed['close'].iloc[-1]
-    
-    # 1. Проверяем точность прошлого прогноза (если он был и его время пришло)
+    # Проверяем точность прошлого прогноза (даже если текущего сигнала нет, но он проверится только когда новый сигнал придет)
+    # Но так как мы теперь не шлем ничего при WAIT, отчет о точности будет накапливаться 
+    // и выведется только при СЛЕДУЮЩЕМ сигнале. 
     accuracy_report = await check_prediction_accuracy(coin_name, df_processed)
     
-    # 2. Если сигнала НЕТ
+    # --- ГЛАВНОЕ ИЗМЕНЕНИЕ: ЕСЛИ СИГНАЛА НЕТ, НИЧЕГО НЕ ДЕЛАЕМ ---
     if signal == "WAIT":
-        # Получаем текущие цены для красивого отображения всех монет
-        # (как просил пользователь: использовать ту же функцию, что и на кнопке)
-        simple_prices = await get_simple_prices()
-        
-        caption = f"💤 **{coin_info['symbol']}**\nСигнал пока не поступил.\n\n"
-        
-        # Добавляем отчет о точности, если он есть
-        if accuracy_report:
-            caption += accuracy_report
-        
-        caption += "💹 **Актуальные цены:**\n"
-        
-        if simple_prices:
-            for name, info in COINS.items():
-                price = simple_prices.get(info['id'], {}).get('usd', 0)
-                if price:
-                    caption += f"• {name}: `${format_price(price)}`\n"
-        else:
-            caption += "Не удалось загрузить цены.\n"
-            
-        # Отправляем текстовое сообщение без графика
-        tasks = []
-        for user_id in subscribers:
-            tasks.append(bot.send_message(chat_id=user_id, text=caption, parse_mode="Markdown"))
-        
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        for user_id, res in zip(subscribers, results):
-            if isinstance(res, Exception):
-                logging.warning(f"Ошибка отправки юзеру {user_id}: {res}. Удаляю.")
-                subscribers.discard(user_id)
+        logging.info(f"Сигнал для {coin_name}: WAIT. Молчим.")
         return
 
-    # 3. Если сигнал ЕСТЬ (LONG или SHORT)
+    # --- ЕСЛИ СИГНАЛ ЕСТЬ (LONG или SHORT) ---
     
-    # Сохраняем текущий прогноз для проверки в будущем
-    # Прогноз дается на следующую свечу (текущее время + интервал)
+    current_price = df_processed['close'].iloc[-1]
+    
+    # Сохраняем новый прогноз
     current_close_time = df_processed['close_time'].iloc[-1]
     next_candle_time = current_close_time + timedelta(minutes=CANDLE_INTERVAL)
     
@@ -344,6 +307,7 @@ async def broadcast_signal(coin_name: str):
         emoji = "🔻"
         status_text = f"SHORT (Уверенность: {confidence:.0f}%)"
     
+    # Формируем сообщение
     caption = (
         f"{emoji} **Прогноз {coin_info['symbol']}**\n\n"
         f"Сигнал: **{status_text}**\n\n"
@@ -352,7 +316,7 @@ async def broadcast_signal(coin_name: str):
         f"Изменение: `{format_diff(diff)}` $\n\n"
     )
     
-    # Добавляем отчет о точности ПРЕДЫДУЩЕГО прогноза (если он только что закрылся)
+    # Добавляем отчет о точности прошлого сигнала (если он был и только что закрылся)
     if accuracy_report:
         caption += f"---\n{accuracy_report}"
 
@@ -375,7 +339,7 @@ async def scheduler_loop():
         seconds_to_next = CANDLE_INTERVAL * 60 - (now.minute % CANDLE_INTERVAL) * 60 - now.second
         
         if seconds_to_next > 5:
-            logging.info(f"До следующей свечи {seconds_to_next} сек. Жду.")
+            logging.info(f"До следующей свечи {seconds_to_next} сек. Ждем.")
             await asyncio.sleep(seconds_to_next)
         
         logging.info("Новая свеча! Запускаю анализ...")
@@ -408,7 +372,7 @@ async def cmd_start(message: types.Message):
     await message.answer(
         "👋 Добро пожаловать!\n\n"
         "Этот бот работает в **автоматическом режиме**.\n"
-        "Он сам анализирует рынок каждые 5 минут и присылает прогнозы.\n\n"
+        "Он присылает прогнозы только при возникновении сигнала.\n\n"
         "Нажмите **Подписаться**, чтобы получать сигналы.\n"
         f"🕐 Часовой пояс: {TIMEZONE_STR}.",
         reply_markup=main_keyboard,
@@ -432,7 +396,7 @@ async def cmd_subscribe(message: types.Message):
         await message.answer("✅ Вы уже подписаны на сигналы.")
     else:
         subscribers.add(user_id)
-        await message.answer("✅ Вы успешно подписались!\nТеперь вы будете получать прогнозы в начале каждой 5-минутной свечи.")
+        await message.answer("✅ Вы успешно подписались!\nТеперь вы будете получать прогнозы только при наличии сигнала.")
 
 @dp.message(F.text == "🔕 Отписаться")
 async def cmd_unsubscribe(message: types.Message):
