@@ -29,8 +29,8 @@ LOCAL_TIMEZONE = ZoneInfo(TIMEZONE_STR)
 STRATEGY_CONFIG = {
     'sma_volume_period': 50,
     'rsi_period': 14,
-    'rsi_long_enter': 40,  # Оставлено 40 для частоты сигналов
-    'rsi_short_enter': 60, # Оставлено 60
+    'rsi_long_enter': 40,  # Больше сигналов LONG
+    'rsi_short_enter': 60, # Больше сигналов SHORT
 }
 
 CANDLE_INTERVAL = 5 # Минуты
@@ -171,21 +171,22 @@ def create_plot(df, target_price, signal, coin_symbol):
     fig, ax = plt.subplots(figsize=(12, 8))
     
     plot_df = df.tail(20).copy()
+    # Для matplotlib убираем timezone
     plot_df['close_time_plot'] = plot_df['close_time'].dt.tz_localize(None)
     
-    # Получаем время последней закрытой свечи (реальное время "сейчас" по данным)
+    # Последняя точка данных (текущая закрытая свеча)
     last_time = plot_df['close_time_plot'].iloc[-1]
-    
-    # Вычисляем время следующей свечи (для прогноза)
-    next_time = last_time + timedelta(minutes=CANDLE_INTERVAL)
-    
     current_price = plot_df['close'].iloc[-1]
+    
+    # --- ИСПРАВЛЕНИЕ: Строго +5 минут ---
+    # Берем время последней свечи и прибавляем ровно 5 минут
+    next_time = last_time + timedelta(minutes=CANDLE_INTERVAL)
     
     # Рисуем историю
     ax.plot(plot_df['close_time_plot'], plot_df['close'], 
             color='cyan', marker='o', linestyle='-', markersize=8, zorder=2)
     
-    # Рисуем прогноз на СЛЕДУЮЩУЮ свечу
+    # Рисуем прогноз
     if signal in ["LONG", "SHORT"]:
         if signal == "LONG": pred_color = 'lime'
         elif signal == "SHORT": pred_color = 'red'
@@ -233,8 +234,8 @@ def create_plot(df, target_price, signal, coin_symbol):
 
 async def check_prediction_accuracy(coin_name: str, df: pd.DataFrame) -> str:
     """
-    Сравнивает сохраненный прогноз с реальной ценой закрытия свечи,
-    на которую был сделан этот прогноз.
+    Проверяет точность прошлого прогноза, сравнивая сохраненную цель 
+    с реальной ценой закрытия свечи.
     """
     if coin_name not in LAST_PREDICTIONS:
         return ""
@@ -243,7 +244,7 @@ async def check_prediction_accuracy(coin_name: str, df: pd.DataFrame) -> str:
     pred_target_time = pred_data['target_time']
     pred_price = pred_data['target_price']
     
-    # Ищем в датафрейме свечу, которая закрылась ТОЧНО в предсказанное время
+    # Ищем свечу, которая закрылась в pred_target_time
     target_row = df[df['close_time'] == pred_target_time]
     
     if not target_row.empty:
@@ -282,7 +283,7 @@ async def broadcast_signal(coin_name: str):
     if signal == "NO_DATA":
         return
 
-    # Проверяем точность ПРЕДЫДУЩЕГО прогноза (если его время пришло)
+    # Проверяем точность прошлого прогноза
     accuracy_report = await check_prediction_accuracy(coin_name, df_processed)
     
     # Если сигнала нет - ничего не шлем
@@ -292,12 +293,9 @@ async def broadcast_signal(coin_name: str):
 
     # Если сигнал ЕСТЬ
     current_price = df_processed['close'].iloc[-1]
-    
-    # Получаем реальное время закрытия последней свечи из данных
     current_close_time = df_processed['close_time'].iloc[-1]
     
-    # Вычисляем время следующей свечи (ЦЕЛЬ прогноза)
-    # Логика: Прогноз делается сейчас (21:30) на следующую свечу (21:35)
+    # Время прогноза: Текущее время + 5 минут
     next_candle_time = current_close_time + timedelta(minutes=CANDLE_INTERVAL)
     
     # Сохраняем прогноз
@@ -306,7 +304,7 @@ async def broadcast_signal(coin_name: str):
         'target_price': pred_price
     }
     
-    # Рисуем график
+    # Генерируем график
     plot_buf = create_plot(df_processed, pred_price, signal, coin_info['symbol'])
     
     diff = pred_price - current_price
@@ -317,7 +315,7 @@ async def broadcast_signal(coin_name: str):
         emoji = "🔻"
         status_text = f"SHORT (Уверенность: {confidence:.0f}%)"
     
-    # Формируем подпись
+    # Формируем сообщение
     caption = (
         f"{emoji} **Прогноз {coin_info['symbol']}**\n\n"
         f"Сигнал: **{status_text}**\n\n"
@@ -326,7 +324,7 @@ async def broadcast_signal(coin_name: str):
         f"Изменение: `{format_diff(diff)}` $\n\n"
     )
     
-    # Добавляем отчет о точности, если он готов
+    # Добавляем точность прошлого прогноза, если есть
     if accuracy_report:
         caption += f"---\n{accuracy_report}"
 
