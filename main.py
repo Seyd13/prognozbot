@@ -3,7 +3,7 @@ import logging
 import os
 from datetime import datetime, timedelta
 from io import BytesIO
-from typing import Union, Optional
+from typing import Union
 
 import aiohttp
 import pandas as pd
@@ -37,9 +37,8 @@ STRATEGY_CONFIG = {
 STARTING_BALANCE = 100
 CANDLE_INTERVAL = 5 # Минуты
 
-# Кэш для защиты от спама запросов
-CACHE_DURATION = 15 # секунд
-request_cache = {}
+# Защита от спама запросами (локальная блокировка)
+processing_locks = {}
 
 # Монеты
 COINS = {
@@ -68,14 +67,6 @@ user_limits = defaultdict(get_default_user_data)
 # --- ФУНКЦИИ ДАННЫХ ---
 
 async def get_market_data(coin_id: str) -> Union[pd.DataFrame, str, None]:
-    # Проверка кэша (защита от спама)
-    now = datetime.now()
-    if coin_id in request_cache:
-        cached_time, cached_data = request_cache[coin_id]
-        if (now - cached_time).total_seconds() < CACHE_DURATION:
-            logging.info(f"Возврат кэшированных данных для {coin_id}")
-            return cached_data
-
     url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days=1"
     headers = {"User-Agent": "Mozilla/5.0"}
 
@@ -103,13 +94,9 @@ async def get_market_data(coin_id: str) -> Union[pd.DataFrame, str, None]:
                     df['timestamp'] = df['timestamp'].dt.tz_localize('UTC').dt.tz_convert(LOCAL_TIMEZONE)
                     df = df.rename(columns={'timestamp': 'close_time'})
                     
-                    result = df.tail(80).reset_index(drop=True)
-                    # Сохраняем в кэш
-                    request_cache[coin_id] = (now, result)
-                    return result
+                    return df.tail(80).reset_index(drop=True)
                 
                 elif response.status == 429:
-                    logging.warning(f"Rate limit hit for {coin_id}")
                     return "RATE_LIMIT"
                 else:
                     logging.error(f"Ошибка HTTP: {response.status}")
@@ -183,13 +170,12 @@ def analyze_with_strategy(df: pd.DataFrame):
     return df, signal, target_price, confidence
 
 def format_price(price: float):
-    """Умное форматирование: 4 знака для мелких, 2 для средних, 0 для крупных."""
+    """Умное форматирование: 4 знака для мелких (TON), 2 для средних, 0 для крупных."""
     if price > 1000:
         return f"{price:,.0f}"
     elif price > 10:
         return f"{price:,.2f}"
     else:
-        # Для TON и копеечных монет - 4 знака
         return f"{price:,.4f}"
 
 def format_diff(diff: float):
@@ -197,7 +183,6 @@ def format_diff(diff: float):
     if abs(diff) > 10:
         return f"{diff:+,.2f}"
     else:
-        # Для мелких разниц показываем больше точности
         return f"{diff:+,.4f}"
 
 def create_plot(df, target_price, signal, coin_symbol):
@@ -341,9 +326,19 @@ async def process_analysis(message: types.Message, coin_name: str):
     user_data = user_limits[user_id]
     coin_data = user_data['coins'][coin_name]
     
+    # Проверка баланса
     if coin_data['balance'] <= 0:
         await message.answer(f"❌ У вас закончились попытки для {coin_name}. Баланс: 0.")
         return
+
+    # Защита от спама (если уже идет запрос от этого юзера)
+    lock_key = f"{user_id}_{coin_name}"
+    if lock_key in processing_locks:
+        await message.answer("⏳ Уже обрабатываю ваш запрос, подождите...")
+        return
+
+    # Ставим лок
+    processing_locks[lock_key] = True
 
     status_msg = await message.answer(f"⏳ Анализ {coin_name}...")
 
@@ -353,10 +348,13 @@ async def process_analysis(message: types.Message, coin_name: str):
         
         if isinstance(result, str) and result == "RATE_LIMIT":
             await status_msg.edit_text("⚠️ Сервер перегружен (429).\nПодождите 1-2 минуты перед следующим запросом.")
+            # Снимаем лок при выходе
+            del processing_locks[lock_key]
             return
         
         if result is None:
             await status_msg.edit_text("❌ Ошибка сети.")
+            del processing_locks[lock_key]
             return
         
         df_raw = result
@@ -383,12 +381,14 @@ async def process_analysis(message: types.Message, coin_name: str):
                     f"⏳ Ждем обновления данных...\n"
                     f"Попробуйте через 10-15 секунд."
                 )
+            del processing_locks[lock_key]
             return
             
         df_processed, signal, pred_price, confidence = analyze_with_strategy(df_raw)
         
         if signal == "NO_DATA":
             await status_msg.edit_text("❌ Мало данных.")
+            del processing_locks[lock_key]
             return
 
         current_price = df_processed['close'].iloc[-1]
@@ -440,6 +440,10 @@ async def process_analysis(message: types.Message, coin_name: str):
     except Exception as e:
         logging.error(f"Критическая ошибка: {e}")
         await status_msg.edit_text("❌ Ошибка бота.")
+    finally:
+        # Гарантированное удаление лока
+        if lock_key in processing_locks:
+            del processing_locks[lock_key]
 
 @dp.message(F.text == "📊 Анализ BTC")
 async def cmd_btc(message: types.Message):
