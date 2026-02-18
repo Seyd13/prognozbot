@@ -166,47 +166,61 @@ def format_diff(diff: float):
     else:
         return f"{diff:+,.4f}"
 
-def create_plot(df, target_price, signal, coin_symbol):
+def create_plot(df, target_price, signal, coin_symbol, current_time, next_time):
     plt.style.use('dark_background')
     fig, ax = plt.subplots(figsize=(12, 8))
     
     plot_df = df.tail(20).copy()
     plot_df['close_time_plot'] = plot_df['close_time'].dt.tz_localize(None)
     
-    # Время последней закрытой свечи из данных
-    last_time = plot_df['close_time_plot'].iloc[-1]
-    current_price = plot_df['close'].iloc[-1]
+    # Последняя закрытая свеча (история)
+    last_history_time = plot_df['close_time_plot'].iloc[-1]
+    last_history_price = plot_df['close'].iloc[-1]
     
-    # Время прогноза: Строго +5 минут
-    next_time = last_time + timedelta(minutes=CANDLE_INTERVAL)
+    # Текущее время (начало формирующейся свечи)
+    current_time_plot = current_time.tz_localize(None)
+    # Время прогноза (конец формирующейся свечи)
+    next_time_plot = next_time.tz_localize(None)
     
+    # 1. Рисуем историю до закрытия прошлой свечи
     ax.plot(plot_df['close_time_plot'], plot_df['close'], 
             color='cyan', marker='o', linestyle='-', markersize=8, zorder=2)
     
+    # 2. Рисуем "текущую" точку (начало свечи) - соединяем с концом истории
+    # Это визуально показывает переход
+    ax.plot([last_history_time, current_time_plot], [last_history_price, last_history_price],
+            color='white', linestyle='-', linewidth=1, alpha=0.5, zorder=2)
+    ax.scatter(current_time_plot, last_history_price, color='white', s=50, zorder=2)
+    ax.annotate(current_time.strftime('%H:%M'), (current_time_plot, last_history_price), 
+                textcoords="offset points", xytext=(0,15), ha='center', fontsize=9, color='white')
+
+    # 3. Рисуем прогноз на конец свечи
     if signal in ["LONG", "SHORT"]:
         if signal == "LONG": pred_color = 'lime'
         elif signal == "SHORT": pred_color = 'red'
         
-        ax.plot([last_time, next_time], [current_price, target_price],
+        # Линия прогноза
+        ax.plot([current_time_plot, next_time_plot], [last_history_price, target_price],
                 color=pred_color, linestyle='--', marker='x', markersize=10, zorder=3)
-        ax.scatter(next_time, target_price, color=pred_color, s=200, zorder=4, edgecolors='white')
+        ax.scatter(next_time_plot, target_price, color=pred_color, s=200, zorder=4, edgecolors='white')
         
         pred_time_str = next_time.strftime('%H:%M')
         pred_price_str = format_price(target_price)
         
-        ax.annotate(pred_time_str, (next_time, target_price), textcoords="offset points", xytext=(0,15), 
+        ax.annotate(pred_time_str, (next_time_plot, target_price), textcoords="offset points", xytext=(0,15), 
                     ha='center', fontsize=10, color=pred_color, fontweight='bold')
-        ax.annotate(pred_price_str, (next_time, target_price), textcoords="offset points", xytext=(0,-15), 
+        ax.annotate(pred_price_str, (next_time_plot, target_price), textcoords="offset points", xytext=(0,-15), 
                     ha='center', fontsize=9, color=pred_color, fontweight='bold')
     
-    for x, y, time_obj in zip(plot_df['close_time_plot'], plot_df['close'], plot_df['close_time']):
+    # Подписи для истории (кроме последней, мы её подписали как "текущую")
+    for x, y, time_obj in zip(plot_df['close_time_plot'].iloc[:-1], plot_df['close'].iloc[:-1], plot_df['close_time'].iloc[:-1]):
         time_str = time_obj.strftime('%H:%M')
         price_str = format_price(y)
         
         ax.annotate(time_str, (x, y), textcoords="offset points", xytext=(0,12), 
-                    ha='center', fontsize=9, color='yellow', fontweight='bold')
+                    ha='center', fontsize=8, color='yellow', fontweight='bold')
         ax.annotate(price_str, (x, y), textcoords="offset points", xytext=(0,-12), 
-                    ha='center', fontsize=8, color='white')
+                    ha='center', fontsize=7, color='white')
 
     ax.get_xaxis().set_visible(False)
     title_suffix = f" ({signal})" if signal in ["LONG", "SHORT"] else " (No Signal)"
@@ -214,7 +228,7 @@ def create_plot(df, target_price, signal, coin_symbol):
     ax.set_ylabel("Цена ($)", color='gray')
     ax.grid(True, color='gray', linestyle=':', alpha=0.3)
     
-    legend_labels = ['История', f'Прогноз ({signal})'] if signal in ["LONG", "SHORT"] else ['История']
+    legend_labels = ['История', f'Текущее', f'Прогноз ({signal})'] if signal in ["LONG", "SHORT"] else ['История', 'Текущее']
     ax.legend(legend_labels, loc='upper left')
 
     buf = BytesIO()
@@ -226,14 +240,14 @@ def create_plot(df, target_price, signal, coin_symbol):
 # --- РАССЫЛКА ---
 
 async def check_prediction_accuracy(coin_name: str, df: pd.DataFrame) -> str:
-    if coin_name not in LAST_PREDICTIONS:
+    if coin_name not in LAST_PREDИCTIONS:
         return ""
     
     pred_data = LAST_PREDICTIONS[coin_name]
     pred_target_time = pred_data['target_time']
     pred_price = pred_data['target_price']
     
-    # Сравниваем с реальной ценой закрытия в это время
+    # Ищем свечу, которая закрылась в заданное время
     target_row = df[df['close_time'] == pred_target_time]
     
     if not target_row.empty:
@@ -273,27 +287,29 @@ async def broadcast_signal(coin_name: str):
 
     accuracy_report = await check_prediction_accuracy(coin_name, df_processed)
     
-    # Если сигнала нет - ничего не делаем (Молчим)
     if signal == "WAIT":
         logging.info(f"Сигнал для {coin_name}: WAIT. Пропуск.")
         return
 
-    # Если сигнал есть
-    current_price = df_processed['close'].iloc[-1]
+    # Время закрытия последней ВЫШЕДШЕЙ свечи
+    last_closed_time = df_processed['close_time'].iloc[-1]
     
-    # Берем время закрытия из DataFrame этой монеты
-    current_close_time = df_processed['close_time'].iloc[-1]
+    # Вычисляем время:
+    # current_real_time = 22:15 (начало новой свечи)
+    # next_candle_time  = 22:20 (конец новой свечи, цель прогноза)
+    current_real_time = last_closed_time + timedelta(minutes=CANDLE_INTERVAL)
+    next_candle_time = current_real_time + timedelta(minutes=CANDLE_INTERVAL)
     
-    # Вычисляем время цели (+5 минут)
-    next_candle_time = current_close_time + timedelta(minutes=CANDLE_INTERVAL)
-    
-    # Сохраняем
+    # Сохраняем прогноз на ЗАКРЫТИЕ свечи (22:20)
     LAST_PREDICTIONS[coin_name] = {
         'target_time': next_candle_time,
         'target_price': pred_price
     }
     
-    plot_buf = create_plot(df_processed, pred_price, signal, coin_info['symbol'])
+    # Цены (берем из последней закрытой свечи)
+    current_price = df_processed['close'].iloc[-1]
+    
+    plot_buf = create_plot(df_processed, pred_price, signal, coin_info['symbol'], current_real_time, next_candle_time)
     
     diff = pred_price - current_price
     if signal == "LONG":
@@ -306,7 +322,7 @@ async def broadcast_signal(coin_name: str):
     caption = (
         f"{emoji} **Прогноз {coin_info['symbol']}**\n\n"
         f"Сигнал: **{status_text}**\n\n"
-        f"Текущая ({current_close_time.strftime('%H:%M')}): `${format_price(current_price)}`\n"
+        f"Текущая ({current_real_time.strftime('%H:%M')}): `${format_price(current_price)}`\n"
         f"Прогноз на ({next_candle_time.strftime('%H:%M')}): `${format_price(pred_price)}`\n"
         f"Изменение: `{format_diff(diff)}` $\n\n"
     )
