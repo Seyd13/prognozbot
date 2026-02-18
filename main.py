@@ -26,17 +26,18 @@ TELEGRAM_TOKEN = "2122435147:AAG_52ELCHjFnXNxcAP4i5xNAal9I91xNTM"
 TIMEZONE_STR = "Europe/Moscow"
 LOCAL_TIMEZONE = ZoneInfo(TIMEZONE_STR)
 
-# --- НАСТРОЙКИ СТРАТЕГИИ ---
+# --- НАСТРОЙКИ СТРАТЕГИИ (СДЕЛАНО ЧУВСТВИТЕЛЬНЕЕ) ---
 STRATEGY_CONFIG = {
     'sma_volume_period': 50,
     'rsi_period': 14,
-    'rsi_long_enter': 30,
-    'rsi_short_enter': 70,
+    # Было 30/70, стало 40/60 - ловим чаще
+    'rsi_long_enter': 40,  
+    'rsi_short_enter': 60, 
 }
 
 CANDLE_INTERVAL = 5 # Минуты
 
-# Хранилище подписчиков (в оперативной памяти)
+# Хранилище подписчиков
 subscribers: Set[int] = set() 
 
 # Монеты
@@ -134,6 +135,7 @@ def analyze_with_strategy(df: pd.DataFrame):
     
     volume_spike = current_vol > avg_vol
     
+    # Логика LONG: если объем выше среднего И RSI меньше границы (40)
     if volume_spike and (current_rsi < STRATEGY_CONFIG['rsi_long_enter']):
         signal = "LONG"
         vol_ratio = current_vol / avg_vol if avg_vol > 0 else 1
@@ -141,6 +143,7 @@ def analyze_with_strategy(df: pd.DataFrame):
         volatility = df['close'].pct_change().tail(5).std()
         target_price = current_price * (1 + volatility * (confidence/50))
 
+    # Логика SHORT: если объем выше среднего И RSI выше границы (60)
     elif volume_spike and (current_rsi > STRATEGY_CONFIG['rsi_short_enter']):
         signal = "SHORT"
         vol_ratio = current_vol / avg_vol if avg_vol > 0 else 1
@@ -178,6 +181,7 @@ def create_plot(df, target_price, signal, coin_symbol):
     ax.plot(plot_df['close_time_plot'], plot_df['close'], 
             color='cyan', marker='o', linestyle='-', markersize=8, zorder=2)
     
+    # График рисуем только если есть сигнал (но функция вызывается только тогда)
     if signal in ["LONG", "SHORT"]:
         if signal == "LONG": pred_color = 'lime'
         elif signal == "SHORT": pred_color = 'red'
@@ -204,13 +208,11 @@ def create_plot(df, target_price, signal, coin_symbol):
                     ha='center', fontsize=8, color='white')
 
     ax.get_xaxis().set_visible(False)
-    title_suffix = f" ({signal})" if signal in ["LONG", "SHORT"] else " (No Signal)"
-    ax.set_title(f"{coin_symbol} Strategy Analysis{title_suffix}", color='white', fontsize=16)
+    ax.set_title(f"{coin_symbol} Strategy Analysis ({signal})", color='white', fontsize=16)
     ax.set_ylabel("Цена ($)", color='gray')
     ax.grid(True, color='gray', linestyle=':', alpha=0.3)
     
-    legend_labels = ['История', f'Прогноз ({signal})'] if signal in ["LONG", "SHORT"] else ['История']
-    ax.legend(legend_labels, loc='upper left')
+    ax.legend(['История', f'Прогноз ({signal})'], loc='upper left')
 
     buf = BytesIO()
     plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
@@ -222,96 +224,84 @@ def create_plot(df, target_price, signal, coin_symbol):
 
 async def broadcast_signal(coin_name: str):
     if not subscribers:
-        return # Нет подписчиков - нет рассылки
+        return
 
     coin_info = COINS[coin_name]
-    logging.info(f"Начинаю анализ {coin_name} для {len(subscribers)} подписчиков...")
+    logging.info(f"Анализ {coin_name} для {len(subscribers)} подписчиков...")
     
     result = await get_market_data(coin_info['id'])
     
     if result is None:
-        logging.warning(f"Не удалось получить данные для {coin_name}")
+        logging.warning(f"Нет данных для {coin_name}")
         return
     
     df_processed, signal, pred_price, confidence = analyze_with_strategy(result)
     
-    if signal == "NO_DATA":
+    # ГЛАВНОЕ ИЗМЕНЕНИЕ: Если сигнала нет (WAIT) - просто выходим, ничего не шлем
+    if signal not in ["LONG", "SHORT"]:
+        logging.info(f"{coin_name}: Сигнала нет (WAIT). Пропуск рассылки.")
         return
 
     current_price = df_processed['close'].iloc[-1]
     
     # Генерируем график
-    plot_buf = create_plot(df_processed, pred_price if signal != "WAIT" else current_price, signal, coin_info['symbol'])
+    plot_buf = create_plot(df_processed, pred_price, signal, coin_info['symbol'])
     
-    # Формируем сообщение
-    if signal == "WAIT":
-        caption = (
-            f"💤 **{coin_info['symbol']}**\n\n"
-            f"Сигнал: **Нет сигнала**\n\n"
-            f"Текущая: `${format_price(current_price)}`\n"
-            f"Условия не выполнены."
-        )
-    else:
-        diff = pred_price - current_price
-        if signal == "LONG":
-            emoji = "🚀"
-            status_text = f"LONG (Уверенность: {confidence:.0f}%)"
-        else:
-            emoji = "🔻"
-            status_text = f"SHORT (Уверенность: {confidence:.0f}%)"
-        
-        caption = (
-            f"{emoji} **Прогноз {coin_info['symbol']}**\n\n"
-            f"Сигнал: **{status_text}**\n\n"
-            f"Текущая: `${format_price(current_price)}`\n"
-            f"Цель: `${format_price(pred_price)}`\n"
-            f"Изменение: `{format_diff(diff)}` $"
-        )
+    # Формируем сообщение (логика WAIT удалена, так как мы уже отсеяли выше)
+    diff = pred_price - current_price
+    if signal == "LONG":
+        emoji = "🚀"
+        status_text = f"LONG (Уверенность: {confidence:.0f}%)"
+    else: # SHORT
+        emoji = "🔻"
+        status_text = f"SHORT (Уверенность: {confidence:.0f}%)"
+    
+    caption = (
+        f"{emoji} **Прогноз {coin_info['symbol']}**\n\n"
+        f"Сигнал: **{status_text}**\n\n"
+        f"Текущая: `${format_price(current_price)}`\n"
+        f"Цель: `${format_price(pred_price)}`\n"
+        f"Изменение: `{format_diff(diff)}` $"
+    )
 
     # Рассылаем всем
     tasks = []
     for user_id in subscribers:
         tasks.append(bot.send_photo(chat_id=user_id, photo=plot_buf, caption=caption, parse_mode="Markdown"))
     
-    # Выполняем отправку, игнорируя ошибки (например, если юзер заблокировал бота)
     results = await asyncio.gather(*tasks, return_exceptions=True)
     
-    # Удаляем тех, кто заблокировал бота
-    for user_id, res in zip(subscribers, results):
+    # Чистим список от заблокировавших бот
+    for user_id, res in zip(list(subscribers), results):
         if isinstance(res, Exception):
-            logging.warning(f"Ошибка отправки юзеру {user_id}: {res}. Удаляю из подписчиков.")
+            logging.warning(f"Ошибка отправки юзеру {user_id}. Удаляю.")
             subscribers.discard(user_id)
 
 async def scheduler_loop():
     while True:
         now = datetime.now(LOCAL_TIMEZONE)
         
-        # Ждем до начала следующей 5-минутной свечи
-        # Например, если сейчас 12:03, ждем 2 минуты до 12:05
-        # Логика: сколько секунд прошло с начала часа, делим на 300, остаток вычитаем.
+        # Расчет времени до следующей свечи
         seconds_to_next = CANDLE_INTERVAL * 60 - (now.minute % CANDLE_INTERVAL) * 60 - now.second
         
-        # Если время пришло (секунды < 5), ждем совсем чуть-чуть, чтобы свеча "закрылась"
         if seconds_to_next > 5:
             logging.info(f"До следующей свечи {seconds_to_next} сек. Жду.")
             await asyncio.sleep(seconds_to_next)
         
-        # Пришло время сбора данных
         logging.info("Новая свеча! Запускаю анализ...")
         
-        # Анализируем все монеты по очереди (чтобы не DDOSить API)
         for coin_name in COINS.keys():
             await broadcast_signal(coin_name)
-            await asyncio.sleep(5) # Пауза между монетами для надежности
+            await asyncio.sleep(5) # Пауза между монетами
         
-        # Спим немного, чтобы не перезапустить цикл в ту же секунду
+        # Пауза чтобы не зацепить текущую минуту повторно
         await asyncio.sleep(15)
 
 # --- ХЕНДЛЕРЫ ---
 
 main_keyboard = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🚀 Подписаться на сигналы"), KeyboardButton(text="🔕 Отписаться")],
+        [KeyboardButton(text="🚀 Подписаться на сигналы")],
         [KeyboardButton(text="💹 Цена сейчас")],
         [KeyboardButton(text="ℹ️ Информация")]
     ],
@@ -321,7 +311,6 @@ main_keyboard = ReplyKeyboardMarkup(
 @dp.startup()
 async def on_startup():
     await bot.delete_webhook(drop_pending_updates=True)
-    # Запускаем фоновый цикл рассылки
     asyncio.create_task(scheduler_loop())
     logging.info("Бот запущен. Рассылка активирована.")
 
@@ -330,8 +319,9 @@ async def cmd_start(message: types.Message):
     await message.answer(
         "👋 Добро пожаловать!\n\n"
         "Этот бот работает в **автоматическом режиме**.\n"
-        "Он сам анализирует рынок каждые 5 минут и присылает прогнозы.\n\n"
-        "Нажмите **Подписаться**, чтобы получать сигналы.\n"
+        "Он анализирует рынок каждые 5 минут.\n\n"
+        "Если условий для входа нет — бот **молчит**.\n"
+        "Если есть сигнал (LONG/SHORT) — пришлет прогноз.\n\n"
         f"🕐 Часовой пояс: {TIMEZONE_STR}.",
         reply_markup=main_keyboard,
         parse_mode="Markdown"
@@ -340,7 +330,7 @@ async def cmd_start(message: types.Message):
 @dp.message(F.text == "ℹ️ Информация")
 async def cmd_info(message: types.Message):
     await message.answer(
-        f"📊 **Логика:**\n"
+        f"📊 **Настройки стратегии:**\n"
         f"LONG: Vol > SMA & RSI < {STRATEGY_CONFIG['rsi_long_enter']}.\n"
         f"SHORT: Vol > SMA & RSI > {STRATEGY_CONFIG['rsi_short_enter']}.\n\n"
         "⚠️ *Не финансовый совет.*",
@@ -351,23 +341,13 @@ async def cmd_info(message: types.Message):
 async def cmd_subscribe(message: types.Message):
     user_id = message.from_user.id
     if user_id in subscribers:
-        await message.answer("✅ Вы уже подписаны на сигналы.")
+        await message.answer("✅ Вы уже подписаны. Ждите сигналов!")
     else:
         subscribers.add(user_id)
-        await message.answer("✅ Вы успешно подписались!\nТеперь вы будете получать прогнозы в начале каждой 5-минутной свечи.")
-
-@dp.message(F.text == "🔕 Отписаться")
-async def cmd_unsubscribe(message: types.Message):
-    user_id = message.from_user.id
-    if user_id in subscribers:
-        subscribers.discard(user_id)
-        await message.answer("❌ Вы отписались от рассылки.")
-    else:
-        await message.answer("Вы не были подписаны.")
+        await message.answer("✅ Подписка оформлена!\nБот будет присылать сигналы, когда они появятся.")
 
 @dp.message(F.text == "💹 Цена сейчас")
 async def cmd_current_price(message: types.Message):
-    # Ручной запрос цен (можно оставить, он редко используется)
     status_msg = await message.answer("⏳ Получение цен...")
     data = await get_simple_prices()
     
