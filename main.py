@@ -178,9 +178,11 @@ def create_plot(df, target_price, signal, coin_symbol):
     next_time = last_time + timedelta(minutes=5)
     current_price = plot_df['close'].iloc[-1]
     
+    # Рисуем историю
     ax.plot(plot_df['close_time_plot'], plot_df['close'], 
             color='cyan', marker='o', linestyle='-', markersize=8, zorder=2)
     
+    # Рисуем прогноз только если есть сигнал
     if signal in ["LONG", "SHORT"]:
         if signal == "LONG": pred_color = 'lime'
         elif signal == "SHORT": pred_color = 'red'
@@ -197,6 +199,7 @@ def create_plot(df, target_price, signal, coin_symbol):
         ax.annotate(pred_price_str, (next_time, target_price), textcoords="offset points", xytext=(0,-15), 
                     ha='center', fontsize=9, color=pred_color, fontweight='bold')
     
+    # Аннотации для истории
     for x, y, time_obj in zip(plot_df['close_time_plot'], plot_df['close'], plot_df['close_time']):
         time_str = time_obj.strftime('%H:%M')
         price_str = format_price(y)
@@ -249,7 +252,7 @@ async def check_prediction_accuracy(coin_name: str, df: pd.DataFrame) -> str:
                 f"Разница: `{sign}{error_pct:.2f}%`\n\n"
             )
             
-            # Удаляем использованный прогноз
+            # Удаляем использованный прогноз, чтобы не проверять его снова
             del LAST_PREDICTIONS[coin_name]
             return accuracy_text
             
@@ -273,9 +276,8 @@ async def broadcast_signal(coin_name: str):
     if signal == "NO_DATA":
         return
 
-    # Проверяем точность прошлого прогноза (даже если текущего сигнала нет, но он проверится только когда новый сигнал придет)
-    # Но так как мы теперь не шлем ничего при WAIT, отчет о точности будет накапливаться 
-    # и выведется только при СЛЕДУЮЩЕМ сигнале. 
+    # Проверяем точность прошлого прогноза. 
+    # Функция сама найдет нужную свечу в df_processed, если она там есть.
     accuracy_report = await check_prediction_accuracy(coin_name, df_processed)
     
     # --- ГЛАВНОЕ ИЗМЕНЕНИЕ: ЕСЛИ СИГНАЛА НЕТ, НИЧЕГО НЕ ДЕЛАЕМ ---
@@ -370,7 +372,7 @@ async def on_startup():
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.answer(
-        "👋 Добро пожаловать!\n\n"
+        "👋 Добро пожолать!\n\n"
         "Этот бот работает в **автоматическом режиме**.\n"
         "Он присылает прогнозы только при возникновении сигнала.\n\n"
         "Нажмите **Подписаться**, чтобы получать сигналы.\n"
@@ -437,4 +439,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
-
