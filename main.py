@@ -3,7 +3,7 @@ import logging
 import os
 from datetime import datetime, timedelta
 from io import BytesIO
-from typing import Union, Set
+from typing import Union, Set, Dict
 
 import aiohttp
 import pandas as pd
@@ -30,13 +30,13 @@ LOCAL_TIMEZONE = ZoneInfo(TIMEZONE_STR)
 STRATEGY_CONFIG = {
     'sma_volume_period': 50,
     'rsi_period': 14,
-    'rsi_long_enter': 40,  
-    'rsi_short_enter': 60, 
+    'rsi_long_enter': 30,
+    'rsi_short_enter': 70,
 }
 
 CANDLE_INTERVAL = 5 # Минуты
 
-# Хранилище подписчиков
+# Хранилище подписчиков (в оперативной памяти)
 subscribers: Set[int] = set() 
 
 # Монеты
@@ -45,6 +45,10 @@ COINS = {
     'ETH': {'id': 'ethereum', 'symbol': 'ETH/USDT'},
     'TON': {'id': 'the-open-network', 'symbol': 'TON/USDT'}
 }
+
+# Хранилище последних прогнозов: { coin_name: {'target_time': datetime, 'target_price': float} }
+# Мы запоминаем, НА КАКОЕ время мы дали прогноз и какую цену указали.
+LAST_PREDICTIONS: Dict[str, Dict] = {}
 
 logging.basicConfig(level=logging.INFO)
 
@@ -171,10 +175,8 @@ def create_plot(df, target_price, signal, coin_symbol):
     plot_df = df.tail(20).copy()
     plot_df['close_time_plot'] = plot_df['close_time'].dt.tz_localize(None)
     
-    # ИСПРАВЛЕНИЕ: Берем время последней свечи и добавляем 5 минут
     last_time = plot_df['close_time_plot'].iloc[-1]
-    next_time = last_time + timedelta(minutes=5) 
-    
+    next_time = last_time + timedelta(minutes=5)
     current_price = plot_df['close'].iloc[-1]
     
     ax.plot(plot_df['close_time_plot'], plot_df['close'], 
@@ -184,7 +186,6 @@ def create_plot(df, target_price, signal, coin_symbol):
         if signal == "LONG": pred_color = 'lime'
         elif signal == "SHORT": pred_color = 'red'
         
-        # Рисуем линию ПРОГНОЗА: от текущей цены к цели в будущем времени (next_time)
         ax.plot([last_time, next_time], [current_price, target_price],
                 color=pred_color, linestyle='--', marker='x', markersize=10, zorder=3)
         ax.scatter(next_time, target_price, color=pred_color, s=200, zorder=4, edgecolors='white')
@@ -207,11 +208,13 @@ def create_plot(df, target_price, signal, coin_symbol):
                     ha='center', fontsize=8, color='white')
 
     ax.get_xaxis().set_visible(False)
-    ax.set_title(f"{coin_symbol} Strategy Analysis ({signal})", color='white', fontsize=16)
+    title_suffix = f" ({signal})" if signal in ["LONG", "SHORT"] else " (No Signal)"
+    ax.set_title(f"{coin_symbol} Strategy Analysis{title_suffix}", color='white', fontsize=16)
     ax.set_ylabel("Цена ($)", color='gray')
     ax.grid(True, color='gray', linestyle=':', alpha=0.3)
     
-    ax.legend(['История', f'Прогноз ({signal})'], loc='upper left')
+    legend_labels = ['История', f'Прогноз ({signal})'] if signal in ["LONG", "SHORT"] else ['История']
+    ax.legend(legend_labels, loc='upper left')
 
     buf = BytesIO()
     plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
@@ -221,12 +224,51 @@ def create_plot(df, target_price, signal, coin_symbol):
 
 # --- РАССЫЛКА (SCHEDULER) ---
 
+async def check_prediction_accuracy(coin_name: str, df: pd.DataFrame) -> str:
+    """
+    Проверяет точность последнего прогноза.
+    Ищет в df свечу, которая соответствует времени target_time из LAST_PREDICTIONS,
+    сравнивает цену закрытия с target_price.
+    """
+    if coin_name not in LAST_PREDICTIONS:
+        return ""
+    
+    pred_data = LAST_PREDICTIONS[coin_name]
+    pred_time = pred_data['target_time']
+    pred_price = pred_data['target_price']
+    
+    # Нам нужно найти свечу, которая закрылась в pred_time.
+    # df содержит свечи с временами закрытия.
+    # Ищем строку, где close_time равен pred_time (с учетом точности минут)
+    target_row = df[df['close_time'] == pred_time]
+    
+    if not target_row.empty:
+        actual_price = target_row.iloc[0]['close']
+        
+        if actual_price > 0:
+            error_pct = ((actual_price - pred_price) / actual_price) * 100
+            # Формируем строку отчета
+            # Например: "Точность прогноза на 12:05: Отклонение 0.5%"
+            sign = "+" if error_pct > 0 else ""
+            accuracy_text = (
+                f"📊 Результат прогноза на {pred_time.strftime('%H:%M')}:\n"
+                f"Цель: `${format_price(pred_price)}` -> Факт: `${format_price(actual_price)}`\n"
+                f"Разница: `{sign}{error_pct:.2f}%`\n\n"
+            )
+            
+            # После того как мы проверили прогноз и вывели результат, удаляем его из истории,
+            # чтобы не проверять его снова на следующих итерациях.
+            del LAST_PREDICTIONS[coin_name]
+            return accuracy_text
+            
+    return ""
+
 async def broadcast_signal(coin_name: str):
     if not subscribers:
         return
 
     coin_info = COINS[coin_name]
-    logging.info(f"Анализ {coin_name} для {len(subscribers)} подписчиков...")
+    logging.info(f"Анализ {coin_name}...")
     
     result = await get_market_data(coin_info['id'])
     
@@ -236,19 +278,69 @@ async def broadcast_signal(coin_name: str):
     
     df_processed, signal, pred_price, confidence = analyze_with_strategy(result)
     
-    if signal not in ["LONG", "SHORT"]:
-        logging.info(f"{coin_name}: Сигнала нет (WAIT). Пропуск рассылки.")
+    if signal == "NO_DATA":
         return
 
     current_price = df_processed['close'].iloc[-1]
     
+    # 1. Проверяем точность прошлого прогноза (если он был и его время пришло)
+    accuracy_report = await check_prediction_accuracy(coin_name, df_processed)
+    
+    # 2. Если сигнала НЕТ
+    if signal == "WAIT":
+        # Получаем текущие цены для красивого отображения всех монет
+        # (как просил пользователь: использовать ту же функцию, что и на кнопке)
+        simple_prices = await get_simple_prices()
+        
+        caption = f"💤 **{coin_info['symbol']}**\nСигнал пока не поступил.\n\n"
+        
+        # Добавляем отчет о точности, если он есть
+        if accuracy_report:
+            caption += accuracy_report
+        
+        caption += "💹 **Актуальные цены:**\n"
+        
+        if simple_prices:
+            for name, info in COINS.items():
+                price = simple_prices.get(info['id'], {}).get('usd', 0)
+                if price:
+                    caption += f"• {name}: `${format_price(price)}`\n"
+        else:
+            caption += "Не удалось загрузить цены.\n"
+            
+        # Отправляем текстовое сообщение без графика
+        tasks = []
+        for user_id in subscribers:
+            tasks.append(bot.send_message(chat_id=user_id, text=caption, parse_mode="Markdown"))
+        
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for user_id, res in zip(subscribers, results):
+            if isinstance(res, Exception):
+                logging.warning(f"Ошибка отправки юзеру {user_id}: {res}. Удаляю.")
+                subscribers.discard(user_id)
+        return
+
+    # 3. Если сигнал ЕСТЬ (LONG или SHORT)
+    
+    # Сохраняем текущий прогноз для проверки в будущем
+    # Прогноз дается на следующую свечу (текущее время + интервал)
+    current_close_time = df_processed['close_time'].iloc[-1]
+    next_candle_time = current_close_time + timedelta(minutes=CANDLE_INTERVAL)
+    
+    LAST_PREDICTIONS[coin_name] = {
+        'target_time': next_candle_time,
+        'target_price': pred_price
+    }
+    
+    # Генерируем график
     plot_buf = create_plot(df_processed, pred_price, signal, coin_info['symbol'])
     
     diff = pred_price - current_price
     if signal == "LONG":
         emoji = "🚀"
         status_text = f"LONG (Уверенность: {confidence:.0f}%)"
-    else: 
+    else:
         emoji = "🔻"
         status_text = f"SHORT (Уверенность: {confidence:.0f}%)"
     
@@ -257,18 +349,23 @@ async def broadcast_signal(coin_name: str):
         f"Сигнал: **{status_text}**\n\n"
         f"Текущая: `${format_price(current_price)}`\n"
         f"Цель: `${format_price(pred_price)}`\n"
-        f"Изменение: `{format_diff(diff)}` $"
+        f"Изменение: `{format_diff(diff)}` $\n\n"
     )
+    
+    # Добавляем отчет о точности ПРЕДЫДУЩЕГО прогноза (если он только что закрылся)
+    if accuracy_report:
+        caption += f"---\n{accuracy_report}"
 
+    # Рассылаем всем
     tasks = []
     for user_id in subscribers:
         tasks.append(bot.send_photo(chat_id=user_id, photo=plot_buf, caption=caption, parse_mode="Markdown"))
     
     results = await asyncio.gather(*tasks, return_exceptions=True)
     
-    for user_id, res in zip(list(subscribers), results):
+    for user_id, res in zip(subscribers, results):
         if isinstance(res, Exception):
-            logging.warning(f"Ошибка отправки юзеру {user_id}. Удаляю.")
+            logging.warning(f"Ошибка отправки юзеру {user_id}: {res}. Удаляю из подписчиков.")
             subscribers.discard(user_id)
 
 async def scheduler_loop():
@@ -293,7 +390,7 @@ async def scheduler_loop():
 
 main_keyboard = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🚀 Подписаться на сигналы")],
+        [KeyboardButton(text="🚀 Подписаться на сигналы"), KeyboardButton(text="🔕 Отписаться")],
         [KeyboardButton(text="💹 Цена сейчас")],
         [KeyboardButton(text="ℹ️ Информация")]
     ],
@@ -311,9 +408,8 @@ async def cmd_start(message: types.Message):
     await message.answer(
         "👋 Добро пожаловать!\n\n"
         "Этот бот работает в **автоматическом режиме**.\n"
-        "Он анализирует рынок каждые 5 минут.\n\n"
-        "Если условий для входа нет — бот **молчит**.\n"
-        "Если есть сигнал (LONG/SHORT) — пришлет прогноз.\n\n"
+        "Он сам анализирует рынок каждые 5 минут и присылает прогнозы.\n\n"
+        "Нажмите **Подписаться**, чтобы получать сигналы.\n"
         f"🕐 Часовой пояс: {TIMEZONE_STR}.",
         reply_markup=main_keyboard,
         parse_mode="Markdown"
@@ -322,7 +418,7 @@ async def cmd_start(message: types.Message):
 @dp.message(F.text == "ℹ️ Информация")
 async def cmd_info(message: types.Message):
     await message.answer(
-        f"📊 **Настройки стратегии:**\n"
+        f"📊 **Логика:**\n"
         f"LONG: Vol > SMA & RSI < {STRATEGY_CONFIG['rsi_long_enter']}.\n"
         f"SHORT: Vol > SMA & RSI > {STRATEGY_CONFIG['rsi_short_enter']}.\n\n"
         "⚠️ *Не финансовый совет.*",
@@ -333,10 +429,19 @@ async def cmd_info(message: types.Message):
 async def cmd_subscribe(message: types.Message):
     user_id = message.from_user.id
     if user_id in subscribers:
-        await message.answer("✅ Вы уже подписаны. Ждите сигналов!")
+        await message.answer("✅ Вы уже подписаны на сигналы.")
     else:
         subscribers.add(user_id)
-        await message.answer("✅ Подписка оформлена!\nБот будет присылать сигналы, когда они появятся.")
+        await message.answer("✅ Вы успешно подписались!\nТеперь вы будете получать прогнозы в начале каждой 5-минутной свечи.")
+
+@dp.message(F.text == "🔕 Отписаться")
+async def cmd_unsubscribe(message: types.Message):
+    user_id = message.from_user.id
+    if user_id in subscribers:
+        subscribers.discard(user_id)
+        await message.answer("❌ Вы отписались от рассылки.")
+    else:
+        await message.answer("Вы не были подписаны.")
 
 @dp.message(F.text == "💹 Цена сейчас")
 async def cmd_current_price(message: types.Message):
