@@ -173,10 +173,11 @@ def create_plot(df, target_price, signal, coin_symbol):
     plot_df = df.tail(20).copy()
     plot_df['close_time_plot'] = plot_df['close_time'].dt.tz_localize(None)
     
+    # Время последней закрытой свечи из данных
     last_time = plot_df['close_time_plot'].iloc[-1]
     current_price = plot_df['close'].iloc[-1]
     
-    # Строго +5 минут
+    # Время прогноза: Строго +5 минут
     next_time = last_time + timedelta(minutes=CANDLE_INTERVAL)
     
     ax.plot(plot_df['close_time_plot'], plot_df['close'], 
@@ -222,7 +223,7 @@ def create_plot(df, target_price, signal, coin_symbol):
     buf.seek(0)
     return BufferedInputFile(buf.getvalue(), f"{coin_symbol.lower()}_prediction.png")
 
-# --- РАССЫЛКА (SCHEDULER) ---
+# --- РАССЫЛКА ---
 
 async def check_prediction_accuracy(coin_name: str, df: pd.DataFrame) -> str:
     if coin_name not in LAST_PREDICTIONS:
@@ -232,6 +233,7 @@ async def check_prediction_accuracy(coin_name: str, df: pd.DataFrame) -> str:
     pred_target_time = pred_data['target_time']
     pred_price = pred_data['target_price']
     
+    # Сравниваем с реальной ценой закрытия в это время
     target_row = df[df['close_time'] == pred_target_time]
     
     if not target_row.empty:
@@ -256,44 +258,14 @@ async def broadcast_signal(coin_name: str):
         return
 
     coin_info = COINS[coin_name]
+    logging.info(f"Анализ {coin_name}...")
     
-    # Цикл ожидания свежих данных
-    # Мы не будем анализировать, пока данные не обновятся до текущей 5-минутки
-    max_retries = 5 # Попыток получить свежие данные
-    for attempt in range(max_retries):
-        result = await get_market_data(coin_info['id'])
-        
-        if result is None:
-            logging.warning(f"Попытка {attempt+1}: Нет данных для {coin_name}")
-            if attempt < max_retries - 1:
-                await asyncio.sleep(2) # Ждем 2 секунды и retry
-                continue
-            else:
-                return # Не получили данные совсем
-
-        # Проверка свежести данных
-        last_candle_time = result['close_time'].iloc[-1]
-        now = datetime.now(LOCAL_TIMEZONE)
-        
-        # Вычисляем, какой должна быть последняя свеча
-        # Округляем текущее время вниз до 5 минут
-        current_candle_floor = now - timedelta(minutes=now.minute % 5, seconds=now.second, microseconds=now.microsecond)
-        
-        # Если данные старые (например, сейчас 21:50, а данные до 21:45)
-        if last_candle_time < current_candle_floor:
-            logging.info(f"{coin_name}: Данные устарели ({last_candle_time.strftime('%H:%M')}), ждем обновления до {current_candle_floor.strftime('%H:%M')}. Попытка {attempt+1}")
-            if attempt < max_retries - 1:
-                await asyncio.sleep(2) 
-                continue # Повторяем запрос
-            else:
-                # Если попытки кончились, используем то, что есть, но с предупреждением
-                logging.warning(f"{coin_name}: Не удалось дождаться свежих данных, анализируем старые.")
-                break # Выходим из цикла retry и идем анализировать то, что есть
-        else:
-            # Данные свежие
-            break
-            
-    # Анализ
+    result = await get_market_data(coin_info['id'])
+    
+    if result is None:
+        logging.warning(f"Нет данных для {coin_name}")
+        return
+    
     df_processed, signal, pred_price, confidence = analyze_with_strategy(result)
     
     if signal == "NO_DATA":
@@ -301,18 +273,21 @@ async def broadcast_signal(coin_name: str):
 
     accuracy_report = await check_prediction_accuracy(coin_name, df_processed)
     
-    # --- ГЛАВНЫЙ БЛОК ФИЛЬТРАЦИИ ---
+    # Если сигнала нет - ничего не делаем (Молчим)
     if signal == "WAIT":
-        # Если сигнала нет, мы просто выходим. НИЧЕГО НЕ ОТПРАВЛЯЕМ.
-        logging.info(f"{coin_name}: Сигнал WAIT. Молчим.")
+        logging.info(f"Сигнал для {coin_name}: WAIT. Пропуск.")
         return
 
-    # Если мы здесь, значит signal == "LONG" или "SHORT"
+    # Если сигнал есть
     current_price = df_processed['close'].iloc[-1]
+    
+    # Берем время закрытия из DataFrame этой монеты
     current_close_time = df_processed['close_time'].iloc[-1]
     
+    # Вычисляем время цели (+5 минут)
     next_candle_time = current_close_time + timedelta(minutes=CANDLE_INTERVAL)
     
+    # Сохраняем
     LAST_PREDICTIONS[coin_name] = {
         'target_time': next_candle_time,
         'target_price': pred_price
