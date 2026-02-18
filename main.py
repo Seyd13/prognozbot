@@ -3,7 +3,7 @@ import logging
 import os
 from datetime import datetime, timedelta
 from io import BytesIO
-from typing import Union
+from typing import Union, Set
 
 import aiohttp
 import pandas as pd
@@ -34,12 +34,10 @@ STRATEGY_CONFIG = {
     'rsi_short_enter': 70,
 }
 
-STARTING_BALANCE = 100
 CANDLE_INTERVAL = 5 # Минуты
 
-# Защита от спама: список юзеров, которые сейчас "в процессе"
-# Если юзер в этом списке, бот просто молча игнорирует его нажатия
-processing_users = set()
+# Хранилище подписчиков (в оперативной памяти)
+subscribers: Set[int] = set() 
 
 # Монеты
 COINS = {
@@ -52,18 +50,6 @@ logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
-
-# --- БАЗА ДАННЫХ ---
-def get_default_user_data():
-    return {
-        'coins': {
-            'BTC': {'balance': STARTING_BALANCE, 'last_candle_time': None},
-            'ETH': {'balance': STARTING_BALANCE, 'last_candle_time': None},
-            'TON': {'balance': STARTING_BALANCE, 'last_candle_time': None}
-        }
-    }
-
-user_limits = defaultdict(get_default_user_data)
 
 # --- ФУНКЦИИ ДАННЫХ ---
 
@@ -96,11 +82,10 @@ async def get_market_data(coin_id: str) -> Union[pd.DataFrame, None]:
                     df = df.rename(columns={'timestamp': 'close_time'})
                     
                     return df.tail(80).reset_index(drop=True)
-                
-                # Если 429 или другая ошибка - просто возвращаем None
                 else:
                     return None
-    except Exception:
+    except Exception as e:
+        logging.error(f"Ошибка сети: {e}")
         return None
 
 async def get_simple_prices():
@@ -233,35 +218,120 @@ def create_plot(df, target_price, signal, coin_symbol):
     buf.seek(0)
     return BufferedInputFile(buf.getvalue(), f"{coin_symbol.lower()}_prediction.png")
 
+# --- РАССЫЛКА (SCHEDULER) ---
+
+async def broadcast_signal(coin_name: str):
+    if not subscribers:
+        return # Нет подписчиков - нет рассылки
+
+    coin_info = COINS[coin_name]
+    logging.info(f"Начинаю анализ {coin_name} для {len(subscribers)} подписчиков...")
+    
+    result = await get_market_data(coin_info['id'])
+    
+    if result is None:
+        logging.warning(f"Не удалось получить данные для {coin_name}")
+        return
+    
+    df_processed, signal, pred_price, confidence = analyze_with_strategy(result)
+    
+    if signal == "NO_DATA":
+        return
+
+    current_price = df_processed['close'].iloc[-1]
+    
+    # Генерируем график
+    plot_buf = create_plot(df_processed, pred_price if signal != "WAIT" else current_price, signal, coin_info['symbol'])
+    
+    # Формируем сообщение
+    if signal == "WAIT":
+        caption = (
+            f"💤 **{coin_info['symbol']}**\n\n"
+            f"Сигнал: **Нет сигнала**\n\n"
+            f"Текущая: `${format_price(current_price)}`\n"
+            f"Условия не выполнены."
+        )
+    else:
+        diff = pred_price - current_price
+        if signal == "LONG":
+            emoji = "🚀"
+            status_text = f"LONG (Уверенность: {confidence:.0f}%)"
+        else:
+            emoji = "🔻"
+            status_text = f"SHORT (Уверенность: {confidence:.0f}%)"
+        
+        caption = (
+            f"{emoji} **Прогноз {coin_info['symbol']}**\n\n"
+            f"Сигнал: **{status_text}**\n\n"
+            f"Текущая: `${format_price(current_price)}`\n"
+            f"Цель: `${format_price(pred_price)}`\n"
+            f"Изменение: `{format_diff(diff)}` $"
+        )
+
+    # Рассылаем всем
+    tasks = []
+    for user_id in subscribers:
+        tasks.append(bot.send_photo(chat_id=user_id, photo=plot_buf, caption=caption, parse_mode="Markdown"))
+    
+    # Выполняем отправку, игнорируя ошибки (например, если юзер заблокировал бота)
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # Удаляем тех, кто заблокировал бота
+    for user_id, res in zip(subscribers, results):
+        if isinstance(res, Exception):
+            logging.warning(f"Ошибка отправки юзеру {user_id}: {res}. Удаляю из подписчиков.")
+            subscribers.discard(user_id)
+
+async def scheduler_loop():
+    while True:
+        now = datetime.now(LOCAL_TIMEZONE)
+        
+        # Ждем до начала следующей 5-минутной свечи
+        # Например, если сейчас 12:03, ждем 2 минуты до 12:05
+        # Логика: сколько секунд прошло с начала часа, делим на 300, остаток вычитаем.
+        seconds_to_next = CANDLE_INTERVAL * 60 - (now.minute % CANDLE_INTERVAL) * 60 - now.second
+        
+        # Если время пришло (секунды < 5), ждем совсем чуть-чуть, чтобы свеча "закрылась"
+        if seconds_to_next > 5:
+            logging.info(f"До следующей свечи {seconds_to_next} сек. Жду.")
+            await asyncio.sleep(seconds_to_next)
+        
+        # Пришло время сбора данных
+        logging.info("Новая свеча! Запускаю анализ...")
+        
+        # Анализируем все монеты по очереди (чтобы не DDOSить API)
+        for coin_name in COINS.keys():
+            await broadcast_signal(coin_name)
+            await asyncio.sleep(5) # Пауза между монетами для надежности
+        
+        # Спим немного, чтобы не перезапустить цикл в ту же секунду
+        await asyncio.sleep(15)
+
 # --- ХЕНДЛЕРЫ ---
 
 main_keyboard = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="📊 Анализ BTC"), KeyboardButton(text="📊 Анализ ETH")],
-        [KeyboardButton(text="📊 Анализ TON")],
+        [KeyboardButton(text="🚀 Подписаться на сигналы"), KeyboardButton(text="🔕 Отписаться")],
         [KeyboardButton(text="💹 Цена сейчас")],
-        [KeyboardButton(text="ℹ️ Информация"), KeyboardButton(text="💳 Мой баланс")]
+        [KeyboardButton(text="ℹ️ Информация")]
     ],
-    resize_keyboard=True,
-    input_field_placeholder="Выберите действие..."
+    resize_keyboard=True
 )
 
 @dp.startup()
 async def on_startup():
     await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("Бот запущен.")
+    # Запускаем фоновый цикл рассылки
+    asyncio.create_task(scheduler_loop())
+    logging.info("Бот запущен. Рассылка активирована.")
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    user_id = message.from_user.id
-    if user_id not in user_limits:
-        user_limits[user_id] = get_default_user_data()
-        
     await message.answer(
         "👋 Добро пожаловать!\n\n"
-        "🧠 **Стратегия:** LHLP Optimized.\n"
-        "⏳ **Лимит:** 1 прогноз на 1 свечу (5 мин).\n"
-        "🔎 Показываю только LONG и SHORT.\n"
+        "Этот бот работает в **автоматическом режиме**.\n"
+        "Он сам анализирует рынок каждые 5 минут и присылает прогнозы.\n\n"
+        "Нажмите **Подписаться**, чтобы получать сигналы.\n"
         f"🕐 Часовой пояс: {TIMEZONE_STR}.",
         reply_markup=main_keyboard,
         parse_mode="Markdown"
@@ -277,184 +347,45 @@ async def cmd_info(message: types.Message):
         parse_mode="Markdown"
     )
 
-@dp.message(F.text == "💳 Мой баланс")
-async def cmd_balance(message: types.Message):
-    user_data = user_limits.get(message.from_user.id, get_default_user_data())
-    balances = user_data['coins']
-    
-    text = (
-        f"💳 **Баланс:**\n\n"
-        f" BTC: `{balances['BTC']['balance']}`\n"
-        f" ETH: `{balances['ETH']['balance']}`\n"
-        f" TON: `{balances['TON']['balance']}`"
-    )
-    await message.answer(text, parse_mode="Markdown")
+@dp.message(F.text == "🚀 Подписаться на сигналы")
+async def cmd_subscribe(message: types.Message):
+    user_id = message.from_user.id
+    if user_id in subscribers:
+        await message.answer("✅ Вы уже подписаны на сигналы.")
+    else:
+        subscribers.add(user_id)
+        await message.answer("✅ Вы успешно подписались!\nТеперь вы будете получать прогнозы в начале каждой 5-минутной свечи.")
+
+@dp.message(F.text == "🔕 Отписаться")
+async def cmd_unsubscribe(message: types.Message):
+    user_id = message.from_user.id
+    if user_id in subscribers:
+        subscribers.discard(user_id)
+        await message.answer("❌ Вы отписались от рассылки.")
+    else:
+        await message.answer("Вы не были подписаны.")
 
 @dp.message(F.text == "💹 Цена сейчас")
 async def cmd_current_price(message: types.Message):
-    user_id = message.from_user.id
-    
-    # Молчаливая защита: если юзер уже в процессе -> игнорируем клик
-    if user_id in processing_users:
-        return
-
-    # Добавляем в список занятых
-    processing_users.add(user_id)
+    # Ручной запрос цен (можно оставить, он редко используется)
     status_msg = await message.answer("⏳ Получение цен...")
+    data = await get_simple_prices()
     
-    try:
-        data = await get_simple_prices()
-        
-        if not data:
-            await status_msg.edit_text("⚠️ Не удалось получить данные.")
-            return
-
-        prices_text = "💹 **Актуальные цены сейчас:**\n\n"
-        
-        for name, info in COINS.items():
-            price = data.get(info['id'], {}).get('usd', None)
-            if price:
-                p_str = format_price(price)
-                prices_text += f"• **{name}:** `${p_str}`\n"
-            else:
-                prices_text += f"• **{name}:** `Ошибка`\n"
-
-        await status_msg.edit_text(prices_text, parse_mode="Markdown")
-    
-    except Exception:
-        pass
-    finally:
-        # Убираем из списка занятых
-        processing_users.discard(user_id)
-
-async def process_analysis(message: types.Message, coin_name: str):
-    user_id = message.from_user.id
-    
-    # 1. Молчаливая защита: если юзер уже в процессе -> игнор
-    if user_id in processing_users:
+    if not data:
+        await status_msg.edit_text("⚠️ Не удалось получить данные.")
         return
 
-    user_data = user_limits[user_id]
-    coin_data = user_data['coins'][coin_name]
+    prices_text = "💹 **Актуальные цены сейчас:**\n\n"
     
-    # 2. Проверка баланса
-    if coin_data['balance'] <= 0:
-        await message.answer(f"❌ У вас закончились попытки для {coin_name}. Баланс: 0.")
-        return
-
-    # 3. ПРОВЕРКА ВРЕМЕНИ (БЕЗ ИНТЕРНЕТА)
-    # Это 100% убивает спам запросами к серверу
-    last_candle_time = coin_data['last_candle_time']
-    now = datetime.now(LOCAL_TIMEZONE)
-    
-    if last_candle_time:
-        next_candle_time = last_candle_time + timedelta(minutes=CANDLE_INTERVAL)
-        if now < next_candle_time:
-            remain_sec = (next_candle_time - now).total_seconds()
-            remain_int = int(remain_sec)
-            
-            await message.answer(
-                f"⏳ Прогноз на эту свечу уже получен.\n"
-                f"Следующая свеча через {remain_int} сек.\n"
-                f"Осталось попыток: {coin_data['balance']}"
-            )
-            return # Выходим, НЕ идем на сервер
-
-    # Если проверки пройдены - ставим флаг "Занят"
-    processing_users.add(user_id)
-    status_msg = await message.answer(f"⏳ Анализ {coin_name}...")
-
-    try:
-        coin_info = COINS[coin_name]
-        # Идем на сервер ТОЛЬКО сейчас
-        result = await get_market_data(coin_info['id'])
-        
-        if result is None:
-            await status_msg.edit_text("⚠️ Ошибка сети. Попробуйте позже.")
-            return
-        
-        df_raw = result
-        
-        # Дополнительная проверка: вдруг сервер отдал старую свечу?
-        server_last_candle = df_raw['close_time'].iloc[-1]
-        if last_candle_time and server_last_candle <= last_candle_time:
-             await status_msg.edit_text(
-                f"⏳ Данные на сервере еще не обновились.\n"
-                f"Попробуйте через 10-15 секунд."
-            )
-             return
-
-        df_processed, signal, pred_price, confidence = analyze_with_strategy(df_raw)
-        
-        if signal == "NO_DATA":
-            await status_msg.edit_text("❌ Мало данных.")
-            return
-
-        current_price = df_processed['close'].iloc[-1]
-        
-        # Успех - списываем баланс и пишем время
-        user_limits[user_id]['coins'][coin_name]['balance'] -= 1
-        user_limits[user_id]['coins'][coin_name]['last_candle_time'] = server_last_candle
-        
-        # --- Логика ответа ---
-        
-        if signal == "WAIT":
-            plot_buf = create_plot(df_processed, current_price, "WAIT", coin_info['symbol'])
-            
-            caption = (
-                f"💤 **{coin_info['symbol']}**\n\n"
-                f"Сигнал: **Нет сигнала**\n\n"
-                f"Текущая: `${format_price(current_price)}`\n"
-                f"Условия для входа не выполнены.\n\n"
-                f"Осталось попыток: `{coin_data['balance'] - 1}`"
-            )
+    for name, info in COINS.items():
+        price = data.get(info['id'], {}).get('usd', None)
+        if price:
+            p_str = format_price(price)
+            prices_text += f"• **{name}:** `${p_str}`\n"
         else:
-            diff = pred_price - current_price
-            
-            if signal == "LONG":
-                emoji = "🚀"
-                status_text = f"LONG (Уверенность: {confidence:.0f}%)"
-            else: # SHORT
-                emoji = "🔻"
-                status_text = f"SHORT (Уверенность: {confidence:.0f}%)"
-            
-            plot_buf = create_plot(df_processed, pred_price, signal, coin_info['symbol'])
-            
-            caption = (
-                f"{emoji} **Прогноз {coin_info['symbol']}**\n\n"
-                f"Сигнал: **{status_text}**\n\n"
-                f"Текущая: `${format_price(current_price)}`\n"
-                f"Цель: `${format_price(pred_price)}`\n"
-                f"Изменение: `{format_diff(diff)}` $\n\n"
-                f"Осталось попыток: `{coin_data['balance'] - 1}`"
-            )
+            prices_text += f"• **{name}:** `Ошибка`\n"
 
-        await status_msg.delete()
-        await bot.send_photo(
-            chat_id=message.chat.id,
-            photo=plot_buf,
-            caption=caption,
-            parse_mode="Markdown"
-        )
-
-    except Exception as e:
-        logging.error(f"Ошибка: {e}")
-        await status_msg.edit_text("❌ Ошибка.")
-    finally:
-        # Снимаем флаг "Занят"
-        processing_users.discard(user_id)
-
-@dp.message(F.text == "📊 Анализ BTC")
-async def cmd_btc(message: types.Message):
-    await process_analysis(message, "BTC")
-
-@dp.message(F.text == "📊 Анализ ETH")
-async def cmd_eth(message: types.Message):
-    await process_analysis(message, "ETH")
-
-@dp.message(F.text == "📊 Анализ TON")
-async def cmd_ton(message: types.Message):
-    await process_analysis(message, "TON")
+    await status_msg.edit_text(prices_text, parse_mode="Markdown")
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
