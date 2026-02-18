@@ -37,8 +37,8 @@ STRATEGY_CONFIG = {
 STARTING_BALANCE = 100
 CANDLE_INTERVAL = 5 # Минуты
 
-# Глобальные блокировки для защиты от спама
-# Хранит ID чатов, которые сейчас обрабатываются
+# Защита от спама: список юзеров, которые сейчас "в процессе"
+# Если юзер в этом списке, бот просто молча игнорирует его нажатия
 processing_users = set()
 
 # Монеты
@@ -67,13 +67,13 @@ user_limits = defaultdict(get_default_user_data)
 
 # --- ФУНКЦИИ ДАННЫХ ---
 
-async def get_market_data(coin_id: str) -> Union[pd.DataFrame, str, None]:
+async def get_market_data(coin_id: str) -> Union[pd.DataFrame, None]:
     url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days=1"
     headers = {"User-Agent": "Mozilla/5.0"}
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as response:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as response:
                 if response.status == 200:
                     data = await response.json()
                     prices = data.get('prices', [])
@@ -97,13 +97,10 @@ async def get_market_data(coin_id: str) -> Union[pd.DataFrame, str, None]:
                     
                     return df.tail(80).reset_index(drop=True)
                 
-                elif response.status == 429:
-                    return "RATE_LIMIT"
+                # Если 429 или другая ошибка - просто возвращаем None
                 else:
-                    logging.error(f"Ошибка HTTP: {response.status}")
                     return None
-    except Exception as e:
-        logging.error(f"Ошибка сети: {e}")
+    except Exception:
         return None
 
 async def get_simple_prices():
@@ -116,8 +113,6 @@ async def get_simple_prices():
             async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
                 if response.status == 200:
                     return await response.json()
-                elif response.status == 429:
-                    return "RATE_LIMIT"
                 return None
     except Exception:
         return None
@@ -299,20 +294,19 @@ async def cmd_balance(message: types.Message):
 async def cmd_current_price(message: types.Message):
     user_id = message.from_user.id
     
-    # Защита от спама (ставим глобальный замок на пользователя)
+    # Молчаливая защита: если юзер уже в процессе -> игнорируем клик
     if user_id in processing_users:
-        await message.answer("⏳ Подождите, предыдущий запрос обрабатывается...")
         return
 
+    # Добавляем в список занятых
     processing_users.add(user_id)
     status_msg = await message.answer("⏳ Получение цен...")
     
     try:
         data = await get_simple_prices()
         
-        if data == "RATE_LIMIT" or not data:
-            # Не показываем 429, просто ошибка сети
-            await status_msg.edit_text("⚠️ Не удалось получить данные. Попробуйте чуть позже.")
+        if not data:
+            await status_msg.edit_text("⚠️ Не удалось получить данные.")
             return
 
         prices_text = "💹 **Актуальные цены сейчас:**\n\n"
@@ -327,19 +321,17 @@ async def cmd_current_price(message: types.Message):
 
         await status_msg.edit_text(prices_text, parse_mode="Markdown")
     
-    except Exception as e:
-        logging.error(f"Ошибка в цене: {e}")
-        await status_msg.edit_text("❌ Ошибка.")
+    except Exception:
+        pass
     finally:
-        # Снимаем замок
+        # Убираем из списка занятых
         processing_users.discard(user_id)
 
 async def process_analysis(message: types.Message, coin_name: str):
     user_id = message.from_user.id
     
-    # 1. Глобальная защита от спама (если жмет как сумасшедший)
+    # 1. Молчаливая защита: если юзер уже в процессе -> игнор
     if user_id in processing_users:
-        await message.answer("⏳ Уже обрабатываю ваш запрос...")
         return
 
     user_data = user_limits[user_id]
@@ -350,8 +342,8 @@ async def process_analysis(message: types.Message, coin_name: str):
         await message.answer(f"❌ У вас закончились попытки для {coin_name}. Баланс: 0.")
         return
 
-    # 3. ПРОВЕРКА ВРЕМЕНИ (БЕЗ ЗАПРОСА К СЕРВЕРУ)
-    # Это главная защита от лишних запросов
+    # 3. ПРОВЕРКА ВРЕМЕНИ (БЕЗ ИНТЕРНЕТА)
+    # Это 100% убивает спам запросами к серверу
     last_candle_time = coin_data['last_candle_time']
     now = datetime.now(LOCAL_TIMEZONE)
     
@@ -368,21 +360,17 @@ async def process_analysis(message: types.Message, coin_name: str):
             )
             return # Выходим, НЕ идем на сервер
 
-    # Если проверки пройдены - ставим глобальный замок
+    # Если проверки пройдены - ставим флаг "Занят"
     processing_users.add(user_id)
     status_msg = await message.answer(f"⏳ Анализ {coin_name}...")
 
     try:
         coin_info = COINS[coin_name]
-        # Идем на сервер
+        # Идем на сервер ТОЛЬКО сейчас
         result = await get_market_data(coin_info['id'])
         
-        if isinstance(result, str) and result == "RATE_LIMIT":
-            await status_msg.edit_text("⚠️ Сервер временно недоступен. Попробуйте через минуту.")
-            return
-        
         if result is None:
-            await status_msg.edit_text("❌ Ошибка сети.")
+            await status_msg.edit_text("⚠️ Ошибка сети. Попробуйте позже.")
             return
         
         df_raw = result
@@ -450,10 +438,10 @@ async def process_analysis(message: types.Message, coin_name: str):
         )
 
     except Exception as e:
-        logging.error(f"Критическая ошибка: {e}")
-        await status_msg.edit_text("❌ Ошибка бота.")
+        logging.error(f"Ошибка: {e}")
+        await status_msg.edit_text("❌ Ошибка.")
     finally:
-        # Снимаем глобальный замок
+        # Снимаем флаг "Занят"
         processing_users.discard(user_id)
 
 @dp.message(F.text == "📊 Анализ BTC")
