@@ -15,7 +15,6 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import BufferedInputFile, ReplyKeyboardMarkup, KeyboardButton
 from dotenv import load_dotenv
-from collections import defaultdict
 from zoneinfo import ZoneInfo
 
 # --- КОНФИГУРАЦИЯ ---
@@ -30,13 +29,13 @@ LOCAL_TIMEZONE = ZoneInfo(TIMEZONE_STR)
 STRATEGY_CONFIG = {
     'sma_volume_period': 50,
     'rsi_period': 14,
-    'rsi_long_enter': 40,  # ИЗМЕНЕНО: Было 30 (чаще ловим рост)
-    'rsi_short_enter': 60, # ИЗМЕНЕНО: Было 70 (чаще ловим падение)
+    'rsi_long_enter': 40,  # Оставлено 40 для частоты сигналов
+    'rsi_short_enter': 60, # Оставлено 60
 }
 
 CANDLE_INTERVAL = 5 # Минуты
 
-# Хранилище подписчиков (в оперативной памяти)
+# Хранилище подписчиков
 subscribers: Set[int] = set() 
 
 # Монеты
@@ -174,23 +173,29 @@ def create_plot(df, target_price, signal, coin_symbol):
     plot_df = df.tail(20).copy()
     plot_df['close_time_plot'] = plot_df['close_time'].dt.tz_localize(None)
     
+    # Получаем время последней закрытой свечи (реальное время "сейчас" по данным)
     last_time = plot_df['close_time_plot'].iloc[-1]
-    next_time = last_time + timedelta(minutes=5)
+    
+    # Вычисляем время следующей свечи (для прогноза)
+    next_time = last_time + timedelta(minutes=CANDLE_INTERVAL)
+    
     current_price = plot_df['close'].iloc[-1]
     
     # Рисуем историю
     ax.plot(plot_df['close_time_plot'], plot_df['close'], 
             color='cyan', marker='o', linestyle='-', markersize=8, zorder=2)
     
-    # Рисуем прогноз только если есть сигнал
+    # Рисуем прогноз на СЛЕДУЮЩУЮ свечу
     if signal in ["LONG", "SHORT"]:
         if signal == "LONG": pred_color = 'lime'
         elif signal == "SHORT": pred_color = 'red'
         
+        # Линия от текущего времени к прогнозу
         ax.plot([last_time, next_time], [current_price, target_price],
                 color=pred_color, linestyle='--', marker='x', markersize=10, zorder=3)
         ax.scatter(next_time, target_price, color=pred_color, s=200, zorder=4, edgecolors='white')
         
+        # Подписи
         pred_time_str = next_time.strftime('%H:%M')
         pred_price_str = format_price(target_price)
         
@@ -199,7 +204,7 @@ def create_plot(df, target_price, signal, coin_symbol):
         ax.annotate(pred_price_str, (next_time, target_price), textcoords="offset points", xytext=(0,-15), 
                     ha='center', fontsize=9, color=pred_color, fontweight='bold')
     
-    # Аннотации для истории
+    # Подписи истории
     for x, y, time_obj in zip(plot_df['close_time_plot'], plot_df['close'], plot_df['close_time']):
         time_str = time_obj.strftime('%H:%M')
         price_str = format_price(y)
@@ -228,17 +233,18 @@ def create_plot(df, target_price, signal, coin_symbol):
 
 async def check_prediction_accuracy(coin_name: str, df: pd.DataFrame) -> str:
     """
-    Проверяет точность последнего прогноза, если время его исполнения пришло.
+    Сравнивает сохраненный прогноз с реальной ценой закрытия свечи,
+    на которую был сделан этот прогноз.
     """
     if coin_name not in LAST_PREDICTIONS:
         return ""
     
     pred_data = LAST_PREDICTIONS[coin_name]
-    pred_time = pred_data['target_time']
+    pred_target_time = pred_data['target_time']
     pred_price = pred_data['target_price']
     
-    # Ищем свечу, которая закрылась в pred_time
-    target_row = df[df['close_time'] == pred_time]
+    # Ищем в датафрейме свечу, которая закрылась ТОЧНО в предсказанное время
+    target_row = df[df['close_time'] == pred_target_time]
     
     if not target_row.empty:
         actual_price = target_row.iloc[0]['close']
@@ -247,12 +253,12 @@ async def check_prediction_accuracy(coin_name: str, df: pd.DataFrame) -> str:
             error_pct = ((actual_price - pred_price) / actual_price) * 100
             sign = "+" if error_pct > 0 else ""
             accuracy_text = (
-                f"📊 Результат прогноза на {pred_time.strftime('%H:%M')}:\n"
+                f"📊 Результат прогноза на {pred_target_time.strftime('%H:%M')}:\n"
                 f"Цель: `${format_price(pred_price)}` -> Факт: `${format_price(actual_price)}`\n"
                 f"Разница: `{sign}{error_pct:.2f}%`\n\n"
             )
             
-            # Удаляем использованный прогноз, чтобы не проверять его снова
+            # Удаляем проверенный прогноз
             del LAST_PREDICTIONS[coin_name]
             return accuracy_text
             
@@ -276,29 +282,31 @@ async def broadcast_signal(coin_name: str):
     if signal == "NO_DATA":
         return
 
-    # Проверяем точность прошлого прогноза. 
-    # Функция сама найдет нужную свечу в df_processed, если она там есть.
+    # Проверяем точность ПРЕДЫДУЩЕГО прогноза (если его время пришло)
     accuracy_report = await check_prediction_accuracy(coin_name, df_processed)
     
-    # --- ГЛАВНОЕ ИЗМЕНЕНИЕ: ЕСЛИ СИГНАЛА НЕТ, НИЧЕГО НЕ ДЕЛАЕМ ---
+    # Если сигнала нет - ничего не шлем
     if signal == "WAIT":
         logging.info(f"Сигнал для {coin_name}: WAIT. Молчим.")
         return
 
-    # --- ЕСЛИ СИГНАЛ ЕСТЬ (LONG или SHORT) ---
-    
+    # Если сигнал ЕСТЬ
     current_price = df_processed['close'].iloc[-1]
     
-    # Сохраняем новый прогноз
+    # Получаем реальное время закрытия последней свечи из данных
     current_close_time = df_processed['close_time'].iloc[-1]
+    
+    # Вычисляем время следующей свечи (ЦЕЛЬ прогноза)
+    # Логика: Прогноз делается сейчас (21:30) на следующую свечу (21:35)
     next_candle_time = current_close_time + timedelta(minutes=CANDLE_INTERVAL)
     
+    # Сохраняем прогноз
     LAST_PREDICTIONS[coin_name] = {
         'target_time': next_candle_time,
         'target_price': pred_price
     }
     
-    # Генерируем график
+    # Рисуем график
     plot_buf = create_plot(df_processed, pred_price, signal, coin_info['symbol'])
     
     diff = pred_price - current_price
@@ -309,20 +317,19 @@ async def broadcast_signal(coin_name: str):
         emoji = "🔻"
         status_text = f"SHORT (Уверенность: {confidence:.0f}%)"
     
-    # Формируем сообщение
+    # Формируем подпись
     caption = (
         f"{emoji} **Прогноз {coin_info['symbol']}**\n\n"
         f"Сигнал: **{status_text}**\n\n"
-        f"Текущая: `${format_price(current_price)}`\n"
-        f"Цель: `${format_price(pred_price)}`\n"
+        f"Текущая ({current_close_time.strftime('%H:%M')}): `${format_price(current_price)}`\n"
+        f"Прогноз на ({next_candle_time.strftime('%H:%M')}): `${format_price(pred_price)}`\n"
         f"Изменение: `{format_diff(diff)}` $\n\n"
     )
     
-    # Добавляем отчет о точности прошлого сигнала (если он был и только что закрылся)
+    # Добавляем отчет о точности, если он готов
     if accuracy_report:
         caption += f"---\n{accuracy_report}"
 
-    # Рассылаем всем
     tasks = []
     for user_id in subscribers:
         tasks.append(bot.send_photo(chat_id=user_id, photo=plot_buf, caption=caption, parse_mode="Markdown"))
@@ -331,7 +338,7 @@ async def broadcast_signal(coin_name: str):
     
     for user_id, res in zip(subscribers, results):
         if isinstance(res, Exception):
-            logging.warning(f"Ошибка отправки юзеру {user_id}: {res}. Удаляю из подписчиков.")
+            logging.warning(f"Ошибка отправки юзеру {user_id}: {res}. Удаляю.")
             subscribers.discard(user_id)
 
 async def scheduler_loop():
@@ -372,7 +379,7 @@ async def on_startup():
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.answer(
-        "👋 Добро пожолать!\n\n"
+        "👋 Добро пожаловать!\n\n"
         "Этот бот работает в **автоматическом режиме**.\n"
         "Он присылает прогнозы только при возникновении сигнала.\n\n"
         "Нажмите **Подписаться**, чтобы получать сигналы.\n"
