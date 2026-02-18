@@ -37,8 +37,9 @@ STRATEGY_CONFIG = {
 STARTING_BALANCE = 100
 CANDLE_INTERVAL = 5 # Минуты
 
-# Защита от спама (локи)
-processing_locks = {}
+# Глобальные блокировки для защиты от спама
+# Хранит ID чатов, которые сейчас обрабатываются
+processing_users = set()
 
 # Монеты
 COINS = {
@@ -296,55 +297,66 @@ async def cmd_balance(message: types.Message):
 
 @dp.message(F.text == "💹 Цена сейчас")
 async def cmd_current_price(message: types.Message):
+    user_id = message.from_user.id
+    
+    # Защита от спама (ставим глобальный замок на пользователя)
+    if user_id in processing_users:
+        await message.answer("⏳ Подождите, предыдущий запрос обрабатывается...")
+        return
+
+    processing_users.add(user_id)
     status_msg = await message.answer("⏳ Получение цен...")
-    data = await get_simple_prices()
     
-    if data == "RATE_LIMIT":
-        await status_msg.edit_text("⚠️ Сервер перегружен. Попробуйте чуть позже.")
-        return
-    
-    if not data:
-        await status_msg.edit_text("❌ Ошибка получения данных.")
-        return
+    try:
+        data = await get_simple_prices()
+        
+        if data == "RATE_LIMIT" or not data:
+            # Не показываем 429, просто ошибка сети
+            await status_msg.edit_text("⚠️ Не удалось получить данные. Попробуйте чуть позже.")
+            return
 
-    prices_text = "💹 **Актуальные цены сейчас:**\n\n"
-    
-    for name, info in COINS.items():
-        price = data.get(info['id'], {}).get('usd', None)
-        if price:
-            p_str = format_price(price)
-            prices_text += f"• **{name}:** `${p_str}`\n"
-        else:
-            prices_text += f"• **{name}:** `Ошибка`\n"
+        prices_text = "💹 **Актуальные цены сейчас:**\n\n"
+        
+        for name, info in COINS.items():
+            price = data.get(info['id'], {}).get('usd', None)
+            if price:
+                p_str = format_price(price)
+                prices_text += f"• **{name}:** `${p_str}`\n"
+            else:
+                prices_text += f"• **{name}:** `Ошибка`\n"
 
-    await status_msg.edit_text(prices_text, parse_mode="Markdown")
+        await status_msg.edit_text(prices_text, parse_mode="Markdown")
+    
+    except Exception as e:
+        logging.error(f"Ошибка в цене: {e}")
+        await status_msg.edit_text("❌ Ошибка.")
+    finally:
+        # Снимаем замок
+        processing_users.discard(user_id)
 
 async def process_analysis(message: types.Message, coin_name: str):
     user_id = message.from_user.id
+    
+    # 1. Глобальная защита от спама (если жмет как сумасшедший)
+    if user_id in processing_users:
+        await message.answer("⏳ Уже обрабатываю ваш запрос...")
+        return
+
     user_data = user_limits[user_id]
     coin_data = user_data['coins'][coin_name]
     
-    # 1. Проверка баланса
+    # 2. Проверка баланса
     if coin_data['balance'] <= 0:
         await message.answer(f"❌ У вас закончились попытки для {coin_name}. Баланс: 0.")
         return
 
-    # 2. Защита от двойных нажатий (локи)
-    lock_key = f"{user_id}_{coin_name}"
-    if lock_key in processing_locks:
-        await message.answer("⏳ Уже обрабатываю ваш запрос, подождите...")
-        return
-
     # 3. ПРОВЕРКА ВРЕМЕНИ (БЕЗ ЗАПРОСА К СЕРВЕРУ)
-    # Это спасает от бана API при частых нажатиях
+    # Это главная защита от лишних запросов
     last_candle_time = coin_data['last_candle_time']
     now = datetime.now(LOCAL_TIMEZONE)
     
     if last_candle_time:
-        # Вычисляем время следующей свечи
         next_candle_time = last_candle_time + timedelta(minutes=CANDLE_INTERVAL)
-        
-        # Если текущее время меньше времени следующей свечи
         if now < next_candle_time:
             remain_sec = (next_candle_time - now).total_seconds()
             remain_int = int(remain_sec)
@@ -354,52 +366,45 @@ async def process_analysis(message: types.Message, coin_name: str):
                 f"Следующая свеча через {remain_int} сек.\n"
                 f"Осталось попыток: {coin_data['balance']}"
             )
-            return # ВЫХОД! Не идем на сервер.
+            return # Выходим, НЕ идем на сервер
 
-    # Если мы здесь - значит, время пришло или не было записано. Ставим лок.
-    processing_locks[lock_key] = True
+    # Если проверки пройдены - ставим глобальный замок
+    processing_users.add(user_id)
     status_msg = await message.answer(f"⏳ Анализ {coin_name}...")
 
     try:
         coin_info = COINS[coin_name]
-        # Идем на сервер ТОЛЬКО если проверка времени прошла
+        # Идем на сервер
         result = await get_market_data(coin_info['id'])
         
         if isinstance(result, str) and result == "RATE_LIMIT":
-            await status_msg.edit_text("⚠️ Сервер перегружен (429).\nПодождите 1-2 минуты.")
-            del processing_locks[lock_key]
+            await status_msg.edit_text("⚠️ Сервер временно недоступен. Попробуйте через минуту.")
             return
         
         if result is None:
             await status_msg.edit_text("❌ Ошибка сети.")
-            del processing_locks[lock_key]
             return
         
         df_raw = result
         
-        # Дополнительная проверка: вдруг свеча на сервере еще не обновилась?
-        # Сравниваем время последней свечи в данных с тем, что мы записали
+        # Дополнительная проверка: вдруг сервер отдал старую свечу?
         server_last_candle = df_raw['close_time'].iloc[-1]
-        
         if last_candle_time and server_last_candle <= last_candle_time:
-             # Это редкий кейс: время на часах новое, а сервер отдал старую свечу
              await status_msg.edit_text(
                 f"⏳ Данные на сервере еще не обновились.\n"
                 f"Попробуйте через 10-15 секунд."
             )
-             del processing_locks[lock_key]
              return
 
         df_processed, signal, pred_price, confidence = analyze_with_strategy(df_raw)
         
         if signal == "NO_DATA":
             await status_msg.edit_text("❌ Мало данных.")
-            del processing_locks[lock_key]
             return
 
         current_price = df_processed['close'].iloc[-1]
         
-        # Списываем баланс и ОБНОВЛЯЕМ ВРЕМЯ СВЕЧИ
+        # Успех - списываем баланс и пишем время
         user_limits[user_id]['coins'][coin_name]['balance'] -= 1
         user_limits[user_id]['coins'][coin_name]['last_candle_time'] = server_last_candle
         
@@ -448,9 +453,8 @@ async def process_analysis(message: types.Message, coin_name: str):
         logging.error(f"Критическая ошибка: {e}")
         await status_msg.edit_text("❌ Ошибка бота.")
     finally:
-        # Убираем лок в любом случае
-        if lock_key in processing_locks:
-            del processing_locks[lock_key]
+        # Снимаем глобальный замок
+        processing_users.discard(user_id)
 
 @dp.message(F.text == "📊 Анализ BTC")
 async def cmd_btc(message: types.Message):
